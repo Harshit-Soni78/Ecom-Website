@@ -1071,9 +1071,44 @@ async def get_settings(admin: dict = Depends(admin_required)):
             "enable_gst_billing": True,
             "default_gst_rate": 18.0,
             "invoice_prefix": "INV",
-            "order_prefix": "ORD"
+            "order_prefix": "ORD",
+            "logo_url": "",
+            "favicon_url": "",
+            "facebook_url": "",
+            "instagram_url": "",
+            "twitter_url": "",
+            "youtube_url": "",
+            "whatsapp_number": "",
+            "upi_id": ""
         }
     return settings
+
+@api_router.get("/settings/public")
+async def get_public_settings():
+    """Get public settings (logo, social links) for frontend"""
+    settings = await db.settings.find_one({"type": "business"}, {"_id": 0})
+    if not settings:
+        return {
+            "business_name": "BharatBazaar",
+            "logo_url": "",
+            "favicon_url": "",
+            "facebook_url": "",
+            "instagram_url": "",
+            "twitter_url": "",
+            "youtube_url": "",
+            "whatsapp_number": ""
+        }
+    
+    return {
+        "business_name": settings.get("business_name", "BharatBazaar"),
+        "logo_url": settings.get("logo_url", ""),
+        "favicon_url": settings.get("favicon_url", ""),
+        "facebook_url": settings.get("facebook_url", ""),
+        "instagram_url": settings.get("instagram_url", ""),
+        "twitter_url": settings.get("twitter_url", ""),
+        "youtube_url": settings.get("youtube_url", ""),
+        "whatsapp_number": settings.get("whatsapp_number", "")
+    }
 
 @api_router.put("/admin/settings")
 async def update_settings(data: SettingsUpdate, admin: dict = Depends(admin_required)):
