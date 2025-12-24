@@ -1242,16 +1242,225 @@ async def get_shipping_label(order_id: str, admin: dict = Depends(admin_required
     
     label = {
         "order_number": order["order_number"],
+        "order_date": order["created_at"],
         "tracking_number": order.get("tracking_number", ""),
         "courier": order.get("courier_provider", ""),
         "from_address": settings.get("address", {}) if settings else {},
+        "from_name": settings.get("business_name", "BharatBazaar") if settings else "BharatBazaar",
+        "from_phone": settings.get("phone", "") if settings else "",
         "to_address": order["shipping_address"],
-        "items_count": len(order["items"]),
+        "items_count": sum(i["quantity"] for i in order["items"]),
         "weight": sum(1 for i in order["items"]),  # Placeholder
-        "cod_amount": order["grand_total"] if order["payment_method"] == "cod" else 0
+        "cod_amount": order["grand_total"] if order["payment_method"] == "cod" else 0,
+        "payment_method": order["payment_method"],
+        "items_summary": [{"name": i["product_name"], "qty": i["quantity"]} for i in order["items"]]
     }
     
     return label
+
+@api_router.get("/admin/orders/{order_id}/packing-slip")
+async def get_packing_slip(order_id: str, admin: dict = Depends(admin_required)):
+    """Generate packing slip with item details for warehouse"""
+    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    settings = await db.settings.find_one({"type": "business"}, {"_id": 0})
+    
+    packing_slip = {
+        "slip_number": f"PS{order['order_number'][3:]}",
+        "order_number": order["order_number"],
+        "order_date": order["created_at"],
+        "customer_name": order["shipping_address"].get("name", ""),
+        "customer_phone": order.get("customer_phone", ""),
+        "shipping_address": order["shipping_address"],
+        "items": [{
+            "product_name": item["product_name"],
+            "sku": item["sku"],
+            "quantity": item["quantity"],
+            "image_url": item.get("image_url", ""),
+            "location": f"Rack-{hash(item['sku']) % 100}"  # Mock warehouse location
+        } for item in order["items"]],
+        "total_items": sum(i["quantity"] for i in order["items"]),
+        "total_skus": len(order["items"]),
+        "special_instructions": order.get("notes", []),
+        "packed_by": "",
+        "packed_at": "",
+        "business_name": settings.get("business_name", "BharatBazaar") if settings else "BharatBazaar",
+        "logo_url": settings.get("logo_url", "") if settings else ""
+    }
+    
+    return packing_slip
+
+@api_router.get("/admin/orders/bulk-labels")
+async def get_bulk_labels(date: Optional[str] = None, admin: dict = Depends(admin_required)):
+    """Get labels for all orders of a specific date (for daily printing)"""
+    if not date:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    
+    query = {
+        "created_at": {"$regex": f"^{date}"},
+        "status": {"$in": ["pending", "processing"]}
+    }
+    
+    orders = await db.orders.find(query, {"_id": 0}).to_list(100)
+    settings = await db.settings.find_one({"type": "business"}, {"_id": 0})
+    
+    labels = []
+    for order in orders:
+        labels.append({
+            "order_number": order["order_number"],
+            "tracking_number": order.get("tracking_number", ""),
+            "courier": order.get("courier_provider", ""),
+            "from_name": settings.get("business_name", "BharatBazaar") if settings else "BharatBazaar",
+            "to_name": order["shipping_address"].get("name", ""),
+            "to_address": f"{order['shipping_address'].get('line1', '')} {order['shipping_address'].get('city', '')} - {order['shipping_address'].get('pincode', '')}",
+            "to_phone": order["shipping_address"].get("phone", ""),
+            "items_count": sum(i["quantity"] for i in order["items"]),
+            "cod_amount": order["grand_total"] if order["payment_method"] == "cod" else 0
+        })
+    
+    return {"date": date, "total_orders": len(labels), "labels": labels}
+
+# ============ ORDER TRACKING ============
+
+@api_router.put("/admin/orders/{order_id}/tracking")
+async def update_order_tracking(order_id: str, data: dict, admin: dict = Depends(admin_required)):
+    """Update order tracking with history"""
+    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    tracking_entry = {
+        "status": data.get("status", order["status"]),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "note": data.get("note", ""),
+        "location": data.get("location", "")
+    }
+    
+    update_data = {
+        "status": data.get("status", order["status"]),
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    if data.get("tracking_number"):
+        update_data["tracking_number"] = data["tracking_number"]
+    if data.get("courier_provider"):
+        update_data["courier_provider"] = data["courier_provider"]
+    
+    await db.orders.update_one(
+        {"id": order_id},
+        {
+            "$set": update_data,
+            "$push": {"tracking_history": tracking_entry}
+        }
+    )
+    
+    # Notify user about tracking update
+    if order.get("user_id"):
+        notification_doc = {
+            "id": generate_id(),
+            "type": "order_update",
+            "title": f"Order #{order['order_number']} Update",
+            "message": f"Your order status: {data.get('status', order['status']).upper()}. {data.get('note', '')}",
+            "user_id": order["user_id"],
+            "data": {"order_id": order_id},
+            "for_admin": False,
+            "read": False,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        await db.notifications.insert_one(notification_doc)
+    
+    updated_order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    return updated_order
+
+# ============ PRODUCT LOOKUP BY BARCODE/SKU ============
+
+@api_router.get("/products/lookup")
+async def lookup_product(sku: Optional[str] = None, barcode: Optional[str] = None):
+    """Lookup product by SKU or barcode for POS scanning"""
+    query = {}
+    if sku:
+        query["sku"] = {"$regex": f"^{sku}$", "$options": "i"}
+    elif barcode:
+        query["$or"] = [
+            {"sku": barcode},
+            {"barcode": barcode}
+        ]
+    else:
+        raise HTTPException(status_code=400, detail="Provide SKU or barcode")
+    
+    product = await db.products.find_one(query, {"_id": 0})
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    
+    return product
+
+# ============ CUSTOMER MANAGEMENT ============
+
+@api_router.get("/admin/customers")
+async def get_customers(
+    search: Optional[str] = None,
+    is_seller: Optional[bool] = None,
+    page: int = 1,
+    limit: int = 20,
+    admin: dict = Depends(admin_required)
+):
+    query = {"role": "customer"}
+    if search:
+        query["$or"] = [
+            {"name": {"$regex": search, "$options": "i"}},
+            {"phone": {"$regex": search}},
+            {"email": {"$regex": search, "$options": "i"}}
+        ]
+    if is_seller is not None:
+        query["is_seller"] = is_seller
+    
+    skip = (page - 1) * limit
+    customers = await db.users.find(query, {"_id": 0, "password": 0}).skip(skip).limit(limit).to_list(limit)
+    total = await db.users.count_documents(query)
+    
+    return {"customers": customers, "total": total, "page": page, "pages": (total + limit - 1) // limit}
+
+@api_router.get("/admin/customers/{customer_id}")
+async def get_customer(customer_id: str, admin: dict = Depends(admin_required)):
+    customer = await db.users.find_one({"id": customer_id}, {"_id": 0, "password": 0})
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    # Get customer's orders
+    orders = await db.orders.find({"user_id": customer_id}, {"_id": 0}).sort("created_at", -1).limit(10).to_list(10)
+    
+    return {"customer": customer, "recent_orders": orders}
+
+@api_router.put("/admin/customers/{customer_id}")
+async def update_customer(customer_id: str, data: dict, admin: dict = Depends(admin_required)):
+    allowed_fields = ["name", "email", "is_seller", "is_wholesale", "gst_number", "addresses"]
+    update_data = {k: v for k, v in data.items() if k in allowed_fields}
+    
+    if update_data:
+        await db.users.update_one({"id": customer_id}, {"$set": update_data})
+    
+    return {"message": "Customer updated"}
+
+# ============ QR CODE FOR PAYMENT ============
+
+@api_router.get("/payment/qr")
+async def get_payment_qr(amount: float):
+    """Generate UPI QR code data for payment"""
+    settings = await db.settings.find_one({"type": "business"}, {"_id": 0})
+    upi_id = settings.get("upi_id", "merchant@upi") if settings else "merchant@upi"
+    business_name = settings.get("business_name", "BharatBazaar") if settings else "BharatBazaar"
+    
+    # UPI deep link format
+    upi_string = f"upi://pay?pa={upi_id}&pn={business_name}&am={amount}&cu=INR"
+    
+    return {
+        "upi_string": upi_string,
+        "upi_id": upi_id,
+        "amount": amount,
+        "business_name": business_name
+    }
 
 # ============ STATIC PAGES ============
 
