@@ -185,6 +185,14 @@ class SettingsUpdate(BaseModel):
     default_gst_rate: float = 18.0
     invoice_prefix: str = "INV"
     order_prefix: str = "ORD"
+    logo_url: Optional[str] = None
+    favicon_url: Optional[str] = None
+    facebook_url: Optional[str] = None
+    instagram_url: Optional[str] = None
+    twitter_url: Optional[str] = None
+    youtube_url: Optional[str] = None
+    whatsapp_number: Optional[str] = None
+    upi_id: Optional[str] = None  # For QR payment
 
 class ReturnRequest(BaseModel):
     order_id: str
