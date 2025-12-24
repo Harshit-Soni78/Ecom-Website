@@ -77,7 +77,7 @@ class BharatBazaarAPITester:
             "POST",
             "auth/login",
             200,
-            data={"phone": "9999999999", "password": "admin123"}
+            data={"phone": "+919999999999", "password": "admin123"}
         )
         if success and 'token' in response:
             self.admin_token = response['token']
