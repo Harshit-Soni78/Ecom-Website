@@ -26,7 +26,7 @@ const menuItems = [
   { icon: ShoppingCart, label: 'Orders', path: '/admin/orders' },
   { icon: Store, label: 'Offline Sales (POS)', path: '/admin/pos' },
   { icon: RefreshCcw, label: 'Returns', path: '/admin/returns' },
-  { icon: Image, label: 'Banners', path: '/admin/banners' },
+  { icon: ImageIcon, label: 'Banners', path: '/admin/banners' },
   { icon: Percent, label: 'Offers', path: '/admin/offers' },
   { icon: Truck, label: 'Couriers', path: '/admin/couriers' },
   { icon: CreditCard, label: 'Payment Gateways', path: '/admin/payments' },
