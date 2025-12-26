@@ -13,7 +13,7 @@ class User(Base):
     id = Column(String(36), primary_key=True, default=generate_uuid)
     phone = Column(String(15), unique=True, index=True)
     name = Column(String(100))
-    email = Column(String(100), nullable=True)
+    email = Column(String(100), unique=True, nullable=True)
     password = Column(String(255))
     gst_number = Column(String(20), nullable=True)
     is_gst_verified = Column(Boolean, default=False)
@@ -79,6 +79,10 @@ class Product(Base):
     gst_rate = Column(Float, default=18.0)
     hsn_code = Column(String(20), nullable=True)
     weight = Column(Float, nullable=True)
+    weight = Column(Float, nullable=True)
+    color = Column(String(50), nullable=True)
+    material = Column(String(100), nullable=True)
+    origin = Column(String(100), nullable=True)
     is_active = Column(Boolean, default=True)
     
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -130,20 +134,51 @@ class ReturnRequest(Base):
     
     items = Column(JSON)
     reason = Column(Text)
+    return_type = Column(String(20), default="defective")  # defective, wrong_item, not_satisfied, damaged
     refund_method = Column(String(20))
-    status = Column(String(20), default="pending")
+    status = Column(String(20), default="pending")  # pending, approved, rejected, pickup_scheduled, picked_up, received, completed
     refund_amount = Column(Float, nullable=True)
     notes = Column(Text, nullable=True)
+    
+    # Evidence for returns
+    evidence_images = Column(JSON, default=list)  # URLs to uploaded evidence images
+    evidence_videos = Column(JSON, default=list)  # URLs to uploaded evidence videos
     
     # Courier tracking for returns
     return_awb = Column(String(50), nullable=True)
     courier_provider = Column(String(50), nullable=True)
     pickup_scheduled_date = Column(DateTime, nullable=True)
+    pickup_completed_date = Column(DateTime, nullable=True)
+    received_date = Column(DateTime, nullable=True)
+    
+    # Admin fields
+    admin_notes = Column(Text, nullable=True)
+    processed_by = Column(String(36), nullable=True)  # Admin user ID who processed the return
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="returns")
+
+class OrderCancellation(Base):
+    __tablename__ = "order_cancellations"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    order_id = Column(String(36), ForeignKey("orders.id"))
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    
+    reason = Column(Text)
+    cancellation_type = Column(String(20), default="customer")  # customer, admin, system
+    cancelled_by = Column(String(36), nullable=True)  # User ID who cancelled
+    refund_amount = Column(Float, nullable=True)
+    refund_status = Column(String(20), default="pending")  # pending, processed, failed
+    
+    # Shipment cancellation details
+    shipment_cancelled = Column(Boolean, default=False)
+    shipment_cancel_response = Column(JSON, nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
 
 class Notification(Base):
     __tablename__ = "notifications"
@@ -224,6 +259,7 @@ class Settings(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     type = Column(String(20), unique=True) # business
     business_name = Column(String(100))
+    company_name = Column(String(100), nullable=True)  # Company name for invoices and labels
     gst_number = Column(String(20), nullable=True)
     address = Column(JSON, nullable=True)
     phone = Column(String(15), nullable=True)
@@ -248,6 +284,38 @@ class InventoryLog(Base):
     notes = Column(Text, nullable=True)
     created_by = Column(String(36), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class WishlistCategory(Base):
+    __tablename__ = "wishlist_categories"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    user_id = Column(String(36), ForeignKey("users.id"))
+    name = Column(String(100))
+    description = Column(Text, nullable=True)
+    color = Column(String(7), default="#3B82F6")  # Hex color code
+    icon = Column(String(50), default="heart")  # Icon name
+    is_default = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    user = relationship("User")
+    wishlist_items = relationship("Wishlist", back_populates="category")
+
+class Wishlist(Base):
+    __tablename__ = "wishlists"
+    
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    user_id = Column(String(36), ForeignKey("users.id"))
+    product_id = Column(String(36), ForeignKey("products.id"))
+    category_id = Column(String(36), ForeignKey("wishlist_categories.id"), nullable=True)
+    notes = Column(Text, nullable=True)  # User notes about the product
+    priority = Column(Integer, default=1)  # 1=Low, 2=Medium, 3=High
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    user = relationship("User")
+    product = relationship("Product")
+    category = relationship("WishlistCategory", back_populates="wishlist_items")
 
 class Page(Base):
     __tablename__ = "pages"
