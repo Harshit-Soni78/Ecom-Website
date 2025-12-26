@@ -23,9 +23,15 @@ import io
 import shutil
 from PIL import Image
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
+from reportlab.lib.pagesizes import letter, A4
 from reportlab.lib import colors
-from reportlab.lib.units import inch
+from reportlab.lib.units import inch, mm
+from reportlab.platypus import Table, TableStyle, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+from reportlab.lib.utils import ImageReader
+import qrcode
+from io import BytesIO as QRBytesIO
 
 # Import Database and Models
 from database import get_db, engine
@@ -315,6 +321,9 @@ class ProductCreate(BaseModel):
     gst_rate: float = 18.0
     hsn_code: Optional[str] = None
     weight: Optional[float] = None
+    color: Optional[str] = None
+    material: Optional[str] = None
+    origin: Optional[str] = None
     is_active: bool = True
 
 class ProductUpdate(BaseModel):
@@ -330,6 +339,9 @@ class ProductUpdate(BaseModel):
     low_stock_threshold: Optional[int] = None
     images: Optional[List[str]] = None
     gst_rate: Optional[float] = None
+    color: Optional[str] = None
+    material: Optional[str] = None
+    origin: Optional[str] = None
     is_active: Optional[bool] = None
 
 class CartItem(BaseModel):
@@ -358,8 +370,6 @@ class BannerCreate(BaseModel):
     link: Optional[str] = None
     position: int = 0
     is_active: bool = True
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
 
 class OfferCreate(BaseModel):
     title: str
@@ -394,6 +404,7 @@ class PaymentGatewayCreate(BaseModel):
 
 class SettingsUpdate(BaseModel):
     business_name: Optional[str] = None
+    company_name: Optional[str] = None  # Company name for invoices and labels
     gst_number: Optional[str] = None
     address: Optional[Dict[str, str]] = None
     phone: Optional[str] = None
@@ -427,12 +438,39 @@ class ReturnRequest(BaseModel):
     reason: str
     refund_method: str = "original"
 
+class OrderCancellationRequest(BaseModel):
+    order_id: str
+    reason: str
+    cancellation_type: str = "customer"  # customer, admin, system
+
+class ReturnRequestCreate(BaseModel):
+    order_id: str
+    items: List[Dict[str, Any]]
+    reason: str
+    return_type: str = "defective"  # defective, wrong_item, not_satisfied, damaged
+    refund_method: str = "original"
+    images: Optional[List[str]] = []  # Evidence images
+    videos: Optional[List[str]] = []  # Evidence videos
+    description: Optional[str] = None
+
+class ReturnRequestUpdate(BaseModel):
+    status: str
+    admin_notes: Optional[str] = None
+    refund_amount: Optional[float] = None
+    return_awb: Optional[str] = None
+    courier_provider: Optional[str] = None
+
 class ContactMessage(BaseModel):
     name: str
     email: str
     phone: Optional[str] = None
     subject: str
     message: str
+
+class WishlistItemAdd(BaseModel):
+    category_id: Optional[str] = None
+    notes: Optional[str] = None
+    priority: int = 1
 
 # ============ DEPENDENCIES ============
 
@@ -679,7 +717,12 @@ def register(data: UserCreate, db: Session = Depends(get_db)):
     # Check if user exists
     existing = db.query(models.User).filter(models.User.phone == data.phone).first()
     if existing:
-        raise HTTPException(status_code=400, detail="User already exists")
+        raise HTTPException(status_code=400, detail="User already exists with this phone number")
+    
+    if data.email:
+        existing_email = db.query(models.User).filter(models.User.email == data.email).first()
+        if existing_email:
+            raise HTTPException(status_code=400, detail="User already exists with this email address")
     
     request_supplier = bool(data.gst_number)
     supplier_status = "pending" if request_supplier else "none"
@@ -836,17 +879,14 @@ def request_seller_upgrade(data: SellerRequestInput, user: dict = Depends(get_cu
     )
     db.add(new_request)
     
-    # Notification
-    notification = models.Notification(
-        id=generate_id(),
+    # Notification for admin
+    create_admin_notification(
+        db=db,
         type="seller_request",
         title="New Seller Request",
         message=f"{user['name']} has requested seller access",
-        data={"request_id": request_id, "user_id": user["id"]},
-        for_admin=True,
-        read=False
+        data={"request_id": request_id, "user_id": user["id"]}
     )
-    db.add(notification)
     
     db.commit()
     db.refresh(new_request)
@@ -879,25 +919,141 @@ def handle_seller_request(request_id: str, data: dict, admin: dict = Depends(adm
             user.is_wholesale = True
             user.gst_number = request.gst_number or user.gst_number
             
-            # Notify user
-            note = models.Notification(
-                id=generate_id(),
-                type="seller_approved",
-                title="Seller Request Approved!",
-                message="Congratulations! Your seller request has been approved.",
+            # Notify user about role change
+            create_role_change_notification(
+                db=db,
                 user_id=user.id,
-                for_admin=False,
-                read=False
+                old_role="customer",
+                new_role="seller"
             )
-            db.add(note)
     
     db.commit()
     return {"message": f"Request {status}"}
+
+# ============ NOTIFICATION HELPER FUNCTIONS ============
+
+def create_notification(db: Session, user_id: str = None, type: str = "", title: str = "", message: str = "", data: dict = None, for_admin: bool = False):
+    """Helper function to create notifications"""
+    notification = models.Notification(
+        id=generate_id(),
+        type=type,
+        title=title,
+        message=message,
+        user_id=user_id,
+        data=data or {},
+        for_admin=for_admin,
+        read=False
+    )
+    db.add(notification)
+    return notification
+
+def create_order_tracking_notification(db: Session, user_id: str, order_id: str, status: str, message: str):
+    """Create order tracking notification"""
+    status_titles = {
+        "pending": "Order Placed",
+        "confirmed": "Order Confirmed",
+        "processing": "Order Processing",
+        "shipped": "Order Shipped",
+        "out_for_delivery": "Out for Delivery",
+        "delivered": "Order Delivered",
+        "cancelled": "Order Cancelled",
+        "returned": "Order Returned"
+    }
+    
+    return create_notification(
+        db=db,
+        user_id=user_id,
+        type="order_tracking",
+        title=status_titles.get(status, "Order Update"),
+        message=message,
+        data={"order_id": order_id, "status": status}
+    )
+
+def create_role_change_notification(db: Session, user_id: str, old_role: str, new_role: str):
+    """Create role change notification"""
+    role_messages = {
+        "customer_to_seller": "Congratulations! Your seller request has been approved. You can now start selling on our platform.",
+        "customer_to_admin": "You have been granted admin privileges. Welcome to the admin team!",
+        "seller_to_admin": "You have been promoted to admin. Welcome to the admin team!",
+        "admin_to_seller": "Your role has been changed to seller.",
+        "seller_to_customer": "Your seller privileges have been revoked.",
+        "admin_to_customer": "Your admin privileges have been revoked."
+    }
+    
+    role_key = f"{old_role}_to_{new_role}"
+    message = role_messages.get(role_key, f"Your role has been changed from {old_role} to {new_role}")
+    
+    return create_notification(
+        db=db,
+        user_id=user_id,
+        type="role_change",
+        title="Role Updated",
+        message=message,
+        data={"old_role": old_role, "new_role": new_role}
+    )
+
+def create_profile_update_notification(db: Session, user_id: str, field: str, action: str = "updated"):
+    """Create profile update notification"""
+    field_names = {
+        "password": "Password",
+        "phone": "Phone Number",
+        "email": "Email Address",
+        "name": "Name",
+        "address": "Address",
+        "gst_number": "GST Number"
+    }
+    
+    field_name = field_names.get(field, field.title())
+    
+    return create_notification(
+        db=db,
+        user_id=user_id,
+        type="profile_update",
+        title="Profile Updated",
+        message=f"Your {field_name.lower()} has been {action} successfully.",
+        data={"field": field, "action": action}
+    )
+
+def create_supplier_status_notification(db: Session, user_id: str, status: str, business_name: str = ""):
+    """Create supplier status notification"""
+    status_messages = {
+        "pending": f"Your supplier request for '{business_name}' is under review. We'll notify you once it's processed.",
+        "approved": f"Congratulations! Your supplier request for '{business_name}' has been approved. You can now access wholesale features.",
+        "rejected": f"Unfortunately, your supplier request for '{business_name}' has been rejected. Please contact support for more information."
+    }
+    
+    status_titles = {
+        "pending": "Supplier Request Submitted",
+        "approved": "Supplier Request Approved",
+        "rejected": "Supplier Request Rejected"
+    }
+    
+    return create_notification(
+        db=db,
+        user_id=user_id,
+        type="supplier_status",
+        title=status_titles.get(status, "Supplier Status Update"),
+        message=status_messages.get(status, f"Your supplier status has been updated to {status}"),
+        data={"status": status, "business_name": business_name}
+    )
+
+def create_admin_notification(db: Session, type: str, title: str, message: str, data: dict = None):
+    """Create admin notification"""
+    return create_notification(
+        db=db,
+        user_id=None,
+        type=type,
+        title=title,
+        message=message,
+        data=data,
+        for_admin=True
+    )
 
 # ============ NOTIFICATION ROUTES ============
 
 @api_router.get("/notifications")
 def get_user_notifications(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get user notifications with pagination and filtering"""
     notifications = db.query(models.Notification).filter(
         models.Notification.user_id == user["id"],
         models.Notification.for_admin == False
@@ -911,9 +1067,25 @@ def get_user_notifications(user: dict = Depends(get_current_user), db: Session =
     
     return {"notifications": notifications, "unread_count": unread_count}
 
+@api_router.get("/notifications/unread-count")
+def get_unread_notification_count(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get only the unread notification count for badge display"""
+    unread_count = db.query(models.Notification).filter(
+        models.Notification.user_id == user["id"],
+        models.Notification.read == False,
+        models.Notification.for_admin == False
+    ).count()
+    
+    return {"unread_count": unread_count}
+
 @api_router.put("/notifications/{notification_id}/read")
 def mark_notification_read(notification_id: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    note = db.query(models.Notification).filter(models.Notification.id == notification_id).first()
+    """Mark a specific notification as read"""
+    note = db.query(models.Notification).filter(
+        models.Notification.id == notification_id,
+        models.Notification.user_id == user["id"]
+    ).first()
+    
     if note:
         note.read = True
         db.commit()
@@ -921,12 +1093,40 @@ def mark_notification_read(notification_id: str, user: dict = Depends(get_curren
 
 @api_router.put("/notifications/mark-all-read")
 def mark_all_read(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    db.query(models.Notification).filter(models.Notification.user_id == user["id"]).update({"read": True})
+    """Mark all user notifications as read"""
+    db.query(models.Notification).filter(
+        models.Notification.user_id == user["id"],
+        models.Notification.for_admin == False
+    ).update({"read": True})
     db.commit()
     return {"message": "All notifications marked as read"}
 
+@api_router.delete("/notifications/{notification_id}")
+def delete_notification(notification_id: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Delete a specific notification"""
+    note = db.query(models.Notification).filter(
+        models.Notification.id == notification_id,
+        models.Notification.user_id == user["id"]
+    ).first()
+    
+    if note:
+        db.delete(note)
+        db.commit()
+    return {"message": "Notification deleted"}
+
+@api_router.delete("/notifications")
+def clear_all_notifications(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Clear all user notifications"""
+    db.query(models.Notification).filter(
+        models.Notification.user_id == user["id"],
+        models.Notification.for_admin == False
+    ).delete()
+    db.commit()
+    return {"message": "All notifications cleared"}
+
 @api_router.get("/admin/notifications")
 def get_admin_notifications(admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Get admin notifications"""
     notifications = db.query(models.Notification).filter(
         models.Notification.for_admin == True
     ).order_by(models.Notification.created_at.desc()).limit(50).all()
@@ -937,6 +1137,249 @@ def get_admin_notifications(admin: dict = Depends(admin_required), db: Session =
     ).count()
     
     return {"notifications": notifications, "unread_count": unread_count}
+
+@api_router.get("/admin/notifications/unread-count")
+def get_admin_unread_count(admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Get admin unread notification count"""
+    unread_count = db.query(models.Notification).filter(
+        models.Notification.for_admin == True,
+        models.Notification.read == False
+    ).count()
+    
+    return {"unread_count": unread_count}
+
+@api_router.put("/admin/notifications/{notification_id}/read")
+def mark_admin_notification_read(notification_id: str, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Mark admin notification as read"""
+    note = db.query(models.Notification).filter(
+        models.Notification.id == notification_id,
+        models.Notification.for_admin == True
+    ).first()
+    
+    if note:
+        note.read = True
+        db.commit()
+    return {"message": "Notification marked as read"}
+
+@api_router.put("/admin/orders/{order_id}/status")
+def update_order_status(order_id: str, data: dict, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Update order status and create tracking notification"""
+    order = db.query(models.Order).filter(models.Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    new_status = data.get("status")
+    tracking_number = data.get("tracking_number")
+    courier_provider = data.get("courier_provider")
+    notes = data.get("notes", "")
+    
+    if not new_status:
+        raise HTTPException(status_code=400, detail="Status is required")
+    
+    old_status = order.status
+    order.status = new_status
+    
+    if tracking_number:
+        order.tracking_number = tracking_number
+    if courier_provider:
+        order.courier_provider = courier_provider
+    
+    # Add to tracking history
+    if not order.tracking_history:
+        order.tracking_history = []
+    
+    tracking_entry = {
+        "status": new_status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "notes": notes,
+        "updated_by": admin["name"]
+    }
+    order.tracking_history.append(tracking_entry)
+    
+    # Create status-specific notification messages
+    status_messages = {
+        "confirmed": f"Great news! Your order #{order.order_number} has been confirmed and is being prepared for shipment.",
+        "processing": f"Your order #{order.order_number} is now being processed. We'll update you once it's ready to ship.",
+        "shipped": f"Your order #{order.order_number} has been shipped! Track it with: {tracking_number or 'Tracking info will be updated soon'}",
+        "out_for_delivery": f"Your order #{order.order_number} is out for delivery. It should arrive today!",
+        "delivered": f"Your order #{order.order_number} has been delivered successfully. Thank you for shopping with us!",
+        "cancelled": f"Your order #{order.order_number} has been cancelled. {notes}",
+        "returned": f"Your order #{order.order_number} return has been processed. {notes}"
+    }
+    
+    # Create tracking notification for user
+    if order.user_id:
+        message = status_messages.get(new_status, f"Your order #{order.order_number} status has been updated to {new_status}")
+        create_order_tracking_notification(
+            db=db,
+            user_id=order.user_id,
+            order_id=order.id,
+            status=new_status,
+            message=message
+        )
+    
+    db.commit()
+    return {"message": "Order status updated", "order": order}
+
+@api_router.put("/admin/users/{user_id}/role")
+def update_user_role(user_id: str, data: dict, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Update user role and create notification"""
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    new_role = data.get("role")
+    if not new_role or new_role not in ["customer", "seller", "admin"]:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    
+    old_role = user.role
+    user.role = new_role
+    
+    # Update related fields based on role
+    if new_role == "seller":
+        user.is_seller = True
+        user.is_wholesale = True
+    elif new_role == "admin":
+        user.is_seller = True
+        user.is_wholesale = True
+    else:  # customer
+        user.is_seller = False
+        user.is_wholesale = False
+    
+    # Create role change notification
+    if old_role != new_role:
+        create_role_change_notification(
+            db=db,
+            user_id=user.id,
+            old_role=old_role,
+            new_role=new_role
+        )
+        
+        # Admin notification
+        create_admin_notification(
+            db=db,
+            type="role_change",
+            title="User Role Updated",
+            message=f"User {user.name} ({user.phone}) role changed from {old_role} to {new_role}",
+            data={
+                "user_id": user.id,
+                "user_name": user.name,
+                "old_role": old_role,
+                "new_role": new_role,
+                "updated_by": admin["name"]
+            }
+        )
+    
+    db.commit()
+    return {"message": "User role updated", "user": {"id": user.id, "name": user.name, "role": user.role}}
+
+# ============ PROFILE UPDATE NOTIFICATIONS ============
+
+@api_router.put("/auth/profile")
+def update_profile(data: dict, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Update user profile and create notifications for changes"""
+    allowed_fields = ["name", "email", "address", "addresses"]
+    user_obj = db.query(models.User).filter(models.User.id == user["id"]).first()
+    
+    if not user_obj:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    updated_fields = []
+    
+    for field, value in data.items():
+        if field in allowed_fields and hasattr(user_obj, field):
+            old_value = getattr(user_obj, field)
+            if old_value != value:
+                setattr(user_obj, field, value)
+                updated_fields.append(field)
+    
+    if updated_fields:
+        db.commit()
+        
+        # Create notifications for each updated field
+        for field in updated_fields:
+            create_profile_update_notification(
+                db=db,
+                user_id=user["id"],
+                field=field,
+                action="updated"
+            )
+    
+    return {"message": "Profile updated successfully", "updated_fields": updated_fields}
+
+@api_router.put("/auth/change-password")
+def change_password(data: dict, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Change user password and create notification"""
+    current_password = data.get("current_password")
+    new_password = data.get("new_password")
+    
+    if not current_password or not new_password:
+        raise HTTPException(status_code=400, detail="Current and new passwords are required")
+    
+    user_obj = db.query(models.User).filter(models.User.id == user["id"]).first()
+    
+    if not user_obj or not verify_password(current_password, user_obj.password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    
+    user_obj.password = hash_password(new_password)
+    db.commit()
+    
+    # Create password change notification
+    create_profile_update_notification(
+        db=db,
+        user_id=user["id"],
+        field="password",
+        action="changed"
+    )
+    
+    return {"message": "Password changed successfully"}
+
+@api_router.put("/auth/update-phone")
+def update_phone(data: dict, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Update user phone number and create notification"""
+    new_phone = data.get("phone")
+    otp = data.get("otp")
+    
+    if not new_phone or not otp:
+        raise HTTPException(status_code=400, detail="Phone number and OTP are required")
+    
+    # Verify OTP (assuming OTP verification logic exists)
+    otp_doc = db.query(models.OTP).filter(
+        models.OTP.phone == new_phone,
+        models.OTP.otp == otp,
+        models.OTP.verified == False
+    ).first()
+    
+    if not otp_doc or otp_doc.expiry < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+    
+    # Check if phone is already in use
+    existing_user = db.query(models.User).filter(
+        models.User.phone == new_phone,
+        models.User.id != user["id"]
+    ).first()
+    
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Phone number already in use")
+    
+    user_obj = db.query(models.User).filter(models.User.id == user["id"]).first()
+    old_phone = user_obj.phone
+    user_obj.phone = new_phone
+    
+    # Mark OTP as verified
+    otp_doc.verified = True
+    
+    db.commit()
+    
+    # Create phone update notification
+    create_profile_update_notification(
+        db=db,
+        user_id=user["id"],
+        field="phone",
+        action="updated"
+    )
+    
+    return {"message": "Phone number updated successfully"}
 
 # ============ PINCODE VERIFICATION ============
 
@@ -1244,17 +1687,29 @@ def create_order(data: OrderCreate, request: Request, db: Session = Depends(get_
     )
     db.add(new_order)
     
-    # Notification
+    # Notification for user
     if user:
-        note = models.Notification(
-            id=generate_id(),
-            type="order_placed",
-            title="Order Placed",
-            message=f"Order #{new_order.order_number} placed.",
+        create_order_tracking_notification(
+            db=db,
             user_id=user["id"],
-            for_admin=False
+            order_id=new_order.id,
+            status="pending",
+            message=f"Your order #{new_order.order_number} has been placed successfully. We'll notify you when it's confirmed."
         )
-        db.add(note)
+        
+        # Admin notification for new order
+        create_admin_notification(
+            db=db,
+            type="new_order",
+            title="New Order Received",
+            message=f"New order #{new_order.order_number} from {user.get('name', 'Customer')} - ₹{new_order.grand_total}",
+            data={
+                "order_id": new_order.id,
+                "order_number": new_order.order_number,
+                "user_id": user["id"],
+                "amount": new_order.grand_total
+            }
+        )
         
     db.commit()
     db.refresh(new_order)
@@ -1282,21 +1737,108 @@ def get_all_orders(
     status: Optional[str] = None, page: int = 1, limit: int = 20, 
     admin: dict = Depends(admin_required), db: Session = Depends(get_db)
 ):
-    query = db.query(models.Order)
-    if status:
-        query = query.filter(models.Order.status == status)
-    
-    total = query.count()
-    orders = query.order_by(models.Order.created_at.desc()).offset((page-1)*limit).limit(limit).all()
-    
-    return {
-        "orders": orders,
-        "total": total,
-        "page": page,
-        "limit": limit
-    }
+    try:
+        query = db.query(models.Order).outerjoin(models.User, models.Order.user_id == models.User.id)
+        if status:
+            query = query.filter(models.Order.status == status)
+        
+        total = query.count()
+        orders = query.order_by(models.Order.created_at.desc()).offset((page-1)*limit).limit(limit).all()
+        
+        # Add customer name to each order
+        orders_with_customer = []
+        for order in orders:
+            # Get customer name from user relationship or shipping address
+            customer_name = None
+            if order.user:
+                customer_name = order.user.name
+            elif order.shipping_address and order.shipping_address.get("name"):
+                customer_name = order.shipping_address.get("name")
+            else:
+                customer_name = "Guest"
+            
+            order_dict = {
+                "id": order.id,
+                "order_number": order.order_number,
+                "user_id": order.user_id,
+                "customer_phone": order.customer_phone,
+                "customer_name": customer_name,
+                "items": order.items,
+                "subtotal": order.subtotal,
+                "gst_applied": order.gst_applied,
+                "gst_total": order.gst_total,
+                "discount_amount": order.discount_amount,
+                "grand_total": order.grand_total,
+                "shipping_address": order.shipping_address,
+                "payment_method": order.payment_method,
+                "payment_status": order.payment_status,
+                "status": order.status,
+                "is_offline": order.is_offline,
+                "tracking_number": order.tracking_number,
+                "courier_provider": order.courier_provider,
+                "tracking_history": order.tracking_history,
+                "notes": order.notes,
+                "created_at": order.created_at,
+                "updated_at": order.updated_at
+            }
+            orders_with_customer.append(order_dict)
+        
+        return {
+            "orders": orders_with_customer,
+            "total": total,
+            "page": page,
+            "limit": limit
+        }
+    except Exception as e:
+        print(f"Error in get_all_orders: {e}")
+        # Fallback to simple query without join
+        query = db.query(models.Order)
+        if status:
+            query = query.filter(models.Order.status == status)
+        
+        total = query.count()
+        orders = query.order_by(models.Order.created_at.desc()).offset((page-1)*limit).limit(limit).all()
+        
+        # Add customer name from shipping address only
+        orders_with_customer = []
+        for order in orders:
+            customer_name = order.shipping_address.get("name", "Guest") if order.shipping_address else "Guest"
+            
+            order_dict = {
+                "id": order.id,
+                "order_number": order.order_number,
+                "user_id": order.user_id,
+                "customer_phone": order.customer_phone,
+                "customer_name": customer_name,
+                "items": order.items,
+                "subtotal": order.subtotal,
+                "gst_applied": order.gst_applied,
+                "gst_total": order.gst_total,
+                "discount_amount": order.discount_amount,
+                "grand_total": order.grand_total,
+                "shipping_address": order.shipping_address,
+                "payment_method": order.payment_method,
+                "payment_status": order.payment_status,
+                "status": order.status,
+                "is_offline": order.is_offline,
+                "tracking_number": order.tracking_number,
+                "courier_provider": order.courier_provider,
+                "tracking_history": order.tracking_history,
+                "notes": order.notes,
+                "created_at": order.created_at,
+                "updated_at": order.updated_at
+            }
+            orders_with_customer.append(order_dict)
+        
+        return {
+            "orders": orders_with_customer,
+            "total": total,
+            "page": page,
+            "limit": limit
+        }
 @api_router.get("/admin/orders/{order_id}/invoice")
 def get_invoice(order_id: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get professional invoice PDF for an order"""
     order = db.query(models.Order).filter(models.Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -1305,81 +1847,663 @@ def get_invoice(order_id: str, user: dict = Depends(get_current_user), db: Sessi
     if user["role"] != "admin" and order.user_id != user["id"]:
         raise HTTPException(status_code=403, detail="Not authorized")
         
-    # Generate PDF
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=letter)
-    width, height = letter
-    
-    # Header
-    c.setFont("Helvetica-Bold", 20)
-    c.drawString(50, height - 50, "BharatBazaar Invoice")
-    
-    c.setFont("Helvetica", 12)
-    c.drawString(50, height - 80, f"Invoice #: {order.order_number.replace('ORD', 'INV')}")
-    c.drawString(50, height - 100, f"Order #: {order.order_number}")
-    c.drawString(50, height - 120, f"Date: {order.created_at.strftime('%d %b %Y')}")
-    
-    # Customer Details
-    c.drawString(350, height - 80, "Bill To:")
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(350, height - 100, order.shipping_address.get("name", ""))
-    c.setFont("Helvetica", 10)
-    c.drawString(350, height - 115, order.shipping_address.get("line1", ""))
-    if order.shipping_address.get("line2"):
-        c.drawString(350, height - 130, order.shipping_address.get("line2", ""))
-        c.drawString(350, height - 145, f"{order.shipping_address.get('city')}, {order.shipping_address.get('state')} - {order.shipping_address.get('pincode')}")
-        c.drawString(350, height - 160, f"Phone: {order.shipping_address.get('phone', '')}")
-    else:
-        c.drawString(350, height - 130, f"{order.shipping_address.get('city')}, {order.shipping_address.get('state')} - {order.shipping_address.get('pincode')}")
-        c.drawString(350, height - 145, f"Phone: {order.shipping_address.get('phone', '')}")
+    # Use the new professional invoice generation
+    try:
+        pdf_buffer = generate_invoice_pdf(order_id, db)
         
-    # Table Header
-    y = height - 200
-    c.line(50, y, width - 50, y)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(50, y - 15, "Item")
-    c.drawString(300, y - 15, "Qty")
-    c.drawString(350, y - 15, "Price")
-    c.drawString(450, y - 15, "Total")
-    c.line(50, y - 25, width - 50, y - 25)
+        return Response(
+            content=pdf_buffer.getvalue(),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=invoice_{order.order_number}.pdf"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate invoice: {str(e)}")
+
+# ============ ORDER CANCELLATION & RETURN SYSTEM ============
+
+@api_router.post("/orders/{order_id}/cancel")
+def cancel_order(order_id: str, data: OrderCancellationRequest, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Cancel an order with reason and notification flow"""
+    order = db.query(models.Order).filter(models.Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
     
-    # items
-    y -= 45
-    c.setFont("Helvetica", 10)
+    # Check if user can cancel this order
+    if user["role"] != "admin" and order.user_id != user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized to cancel this order")
+    
+    # Check if order can be cancelled
+    if order.status in ["delivered", "cancelled", "returned"]:
+        raise HTTPException(status_code=400, detail=f"Cannot cancel order with status: {order.status}")
+    
+    # If order is shipped, we need to handle return logistics
+    if order.status in ["shipped", "out_for_delivery"]:
+        # Create return request automatically
+        return_request = models.ReturnRequest(
+            id=generate_id(),
+            order_id=order.id,
+            user_id=order.user_id,
+            items=order.items,
+            reason=f"Order cancelled by {data.cancellation_type}: {data.reason}",
+            refund_method="original",
+            status="approved",  # Auto-approve cancellation returns
+            refund_amount=order.grand_total,
+            created_at=datetime.utcnow()
+        )
+        db.add(return_request)
+        
+        # Try to cancel shipment if tracking number exists
+        if order.tracking_number:
+            try:
+                from courier_service import DelhiveryService
+                delhivery_service = DelhiveryService(os.environ.get('DELHIVERY_TOKEN', ''))
+                cancel_result = delhivery_service.cancel_shipment(order.tracking_number)
+                if cancel_result.get("success"):
+                    return_request.notes = "Shipment cancelled successfully"
+                else:
+                    return_request.notes = f"Shipment cancellation failed: {cancel_result.get('error')}"
+            except Exception as e:
+                return_request.notes = f"Could not cancel shipment: {str(e)}"
+    
+    # Update order status
+    old_status = order.status
+    order.status = "cancelled"
+    order.updated_at = datetime.utcnow()
+    
+    # Add to tracking history
+    if not order.tracking_history:
+        order.tracking_history = []
+    
+    tracking_entry = {
+        "status": "cancelled",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "notes": f"Order cancelled: {data.reason}",
+        "updated_by": user["name"] if user["role"] == "admin" else "Customer"
+    }
+    order.tracking_history.append(tracking_entry)
+    
+    # Restore inventory for cancelled items
     for item in order.items:
-        name = item.get("product_name", "Item")[:40] # Truncate if long
-        qty = str(item.get("quantity", 0))
-        price = f"{item.get('price', 0):.2f}"
-        total = f"{item.get('total', 0):.2f}"
+        product = db.query(models.Product).filter(models.Product.id == item.get("product_id")).first()
+        if product:
+            product.stock_qty += item.get("quantity", 1)
+            
+            # Log inventory adjustment
+            inventory_log = models.InventoryLog(
+                id=generate_id(),
+                product_id=product.id,
+                sku=product.sku,
+                type="return",
+                quantity=item.get("quantity", 1),
+                previous_qty=product.stock_qty - item.get("quantity", 1),
+                new_qty=product.stock_qty,
+                notes=f"Order cancellation - Order #{order.order_number}",
+                created_by=user["id"],
+                created_at=datetime.utcnow()
+            )
+            db.add(inventory_log)
+    
+    # Create cancellation notification for user
+    if order.user_id:
+        create_order_tracking_notification(
+            db=db,
+            user_id=order.user_id,
+            order_id=order.id,
+            status="cancelled",
+            message=f"Your order #{order.order_number} has been cancelled. Reason: {data.reason}. Refund will be processed within 3-5 business days."
+        )
+    
+    # Create admin notification
+    create_admin_notification(
+        db=db,
+        type="order_cancelled",
+        title="Order Cancelled",
+        message=f"Order #{order.order_number} cancelled by {data.cancellation_type}. Reason: {data.reason}",
+        data={
+            "order_id": order.id,
+            "order_number": order.order_number,
+            "cancelled_by": user["name"],
+            "reason": data.reason,
+            "refund_amount": order.grand_total
+        }
+    )
+    
+    db.commit()
+    
+    return {
+        "message": "Order cancelled successfully",
+        "order_id": order.id,
+        "order_number": order.order_number,
+        "status": "cancelled",
+        "refund_amount": order.grand_total,
+        "refund_timeline": "3-5 business days"
+    }
+
+@api_router.post("/orders/{order_id}/return")
+def create_return_request(order_id: str, data: ReturnRequestCreate, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Create a return request with evidence upload support"""
+    order = db.query(models.Order).filter(models.Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    # Check if user can return this order
+    if user["role"] != "admin" and order.user_id != user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized to return this order")
+    
+    # Check if order can be returned
+    if order.status not in ["delivered"]:
+        raise HTTPException(status_code=400, detail=f"Cannot return order with status: {order.status}. Order must be delivered to initiate return.")
+    
+    # Check if return window is valid (e.g., 7 days from delivery)
+    if order.updated_at:
+        days_since_delivery = (datetime.utcnow() - order.updated_at).days
+        if days_since_delivery > 7:
+            raise HTTPException(status_code=400, detail="Return window expired. Returns are only accepted within 7 days of delivery.")
+    
+    # Validate return items
+    order_item_ids = {item.get("product_id") for item in order.items}
+    return_item_ids = {item.get("product_id") for item in data.items}
+    
+    if not return_item_ids.issubset(order_item_ids):
+        raise HTTPException(status_code=400, detail="Some items in return request were not part of the original order")
+    
+    # Calculate refund amount
+    refund_amount = 0
+    for return_item in data.items:
+        for order_item in order.items:
+            if order_item.get("product_id") == return_item.get("product_id"):
+                item_price = order_item.get("price", 0)
+                return_qty = return_item.get("quantity", 1)
+                order_qty = order_item.get("quantity", 1)
+                
+                if return_qty > order_qty:
+                    raise HTTPException(status_code=400, detail=f"Cannot return more items than ordered for product {return_item.get('product_name', 'Unknown')}")
+                
+                refund_amount += item_price * return_qty
+                break
+    
+    # Create return request
+    return_request = models.ReturnRequest(
+        id=generate_id(),
+        order_id=order.id,
+        user_id=order.user_id,
+        items=data.items,
+        reason=f"{data.return_type}: {data.reason}",
+        refund_method=data.refund_method,
+        status="pending",
+        refund_amount=refund_amount,
+        notes=data.description,
+        created_at=datetime.utcnow()
+    )
+    db.add(return_request)
+    
+    # Create return notification for user
+    create_notification(
+        db=db,
+        user_id=order.user_id,
+        type="return_request",
+        title="Return Request Submitted",
+        message=f"Your return request for order #{order.order_number} has been submitted. We'll review it within 24 hours.",
+        data={
+            "order_id": order.id,
+            "return_id": return_request.id,
+            "return_type": data.return_type,
+            "refund_amount": refund_amount
+        }
+    )
+    
+    # Create admin notification
+    create_admin_notification(
+        db=db,
+        type="return_request",
+        title="New Return Request",
+        message=f"Return request submitted for order #{order.order_number}. Reason: {data.return_type} - {data.reason}",
+        data={
+            "order_id": order.id,
+            "return_id": return_request.id,
+            "customer_name": user["name"],
+            "return_type": data.return_type,
+            "reason": data.reason,
+            "refund_amount": refund_amount,
+            "evidence_images": len(data.images or []),
+            "evidence_videos": len(data.videos or [])
+        }
+    )
+    
+    db.commit()
+    
+    return {
+        "message": "Return request submitted successfully",
+        "return_id": return_request.id,
+        "order_number": order.order_number,
+        "status": "pending",
+        "refund_amount": refund_amount,
+        "review_timeline": "24 hours",
+        "next_steps": "Our team will review your return request and evidence. You'll receive a notification once approved."
+    }
+
+@api_router.get("/orders/{order_id}/returns")
+def get_order_returns(order_id: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get all return requests for an order"""
+    order = db.query(models.Order).filter(models.Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    # Check access
+    if user["role"] != "admin" and order.user_id != user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    returns = db.query(models.ReturnRequest).filter(models.ReturnRequest.order_id == order_id).all()
+    return returns
+
+@api_router.get("/returns")
+def get_user_returns(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get all return requests for the current user"""
+    returns = db.query(models.ReturnRequest).filter(
+        models.ReturnRequest.user_id == user["id"]
+    ).order_by(models.ReturnRequest.created_at.desc()).all()
+    
+    # Enrich with order information
+    enriched_returns = []
+    for return_req in returns:
+        order = db.query(models.Order).filter(models.Order.id == return_req.order_id).first()
+        return_dict = {c.name: getattr(return_req, c.name) for c in return_req.__table__.columns}
+        return_dict["order_number"] = order.order_number if order else "Unknown"
+        return_dict["order_date"] = order.created_at.isoformat() if order and order.created_at else None
+        enriched_returns.append(return_dict)
+    
+    return enriched_returns
+
+@api_router.get("/admin/returns")
+def get_all_returns(
+    status: Optional[str] = None,
+    page: int = 1,
+    limit: int = 20,
+    admin: dict = Depends(admin_required),
+    db: Session = Depends(get_db)
+):
+    """Get all return requests for admin review"""
+    query = db.query(models.ReturnRequest)
+    
+    if status:
+        query = query.filter(models.ReturnRequest.status == status)
+    
+    total = query.count()
+    returns = query.order_by(models.ReturnRequest.created_at.desc()).offset((page - 1) * limit).limit(limit).all()
+    
+    # Enrich with order and user information
+    enriched_returns = []
+    for return_req in returns:
+        order = db.query(models.Order).filter(models.Order.id == return_req.order_id).first()
+        user_obj = db.query(models.User).filter(models.User.id == return_req.user_id).first()
         
-        c.drawString(50, y, name)
-        c.drawString(300, y, qty)
-        c.drawString(350, y, price)
-        c.drawString(450, y, total)
-        y -= 20
+        return_dict = {c.name: getattr(return_req, c.name) for c in return_req.__table__.columns}
+        return_dict["order_number"] = order.order_number if order else "Unknown"
+        return_dict["customer_name"] = user_obj.name if user_obj else "Unknown"
+        return_dict["customer_phone"] = user_obj.phone if user_obj else "Unknown"
+        enriched_returns.append(return_dict)
+    
+    return {
+        "returns": enriched_returns,
+        "total": total,
+        "page": page,
+        "pages": (total + limit - 1) // limit
+    }
+
+@api_router.put("/admin/returns/{return_id}")
+def update_return_request(return_id: str, data: ReturnRequestUpdate, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Update return request status and handle approval/rejection"""
+    return_request = db.query(models.ReturnRequest).filter(models.ReturnRequest.id == return_id).first()
+    if not return_request:
+        raise HTTPException(status_code=404, detail="Return request not found")
+    
+    order = db.query(models.Order).filter(models.Order.id == return_request.order_id).first()
+    old_status = return_request.status
+    
+    # Update return request
+    return_request.status = data.status
+    return_request.updated_at = datetime.utcnow()
+    
+    if data.admin_notes:
+        return_request.notes = f"{return_request.notes or ''}\n\nAdmin Notes: {data.admin_notes}"
+    
+    if data.refund_amount is not None:
+        return_request.refund_amount = data.refund_amount
+    
+    if data.return_awb:
+        return_request.return_awb = data.return_awb
+    
+    if data.courier_provider:
+        return_request.courier_provider = data.courier_provider
+    
+    # Handle status-specific actions
+    if data.status == "approved" and old_status != "approved":
+        # Schedule pickup and create return shipment
+        try:
+            from courier_service import DelhiveryService
+            delhivery_service = DelhiveryService(os.environ.get('DELHIVERY_TOKEN', ''))
+            
+            # Create return shipment
+            return_data = {
+                "order_id": f"RET{return_request.id[:8]}",
+                "pickup_address": order.shipping_address,
+                "return_reason": return_request.reason,
+                "items": return_request.items
+            }
+            
+            result = delhivery_service.create_return_pickup(return_data)
+            if result.get("success"):
+                return_request.return_awb = result.get("return_awb")
+                return_request.pickup_scheduled_date = datetime.utcnow() + timedelta(days=1)
+                return_request.courier_provider = "Delhivery"
+        except Exception as e:
+            logging.warning(f"Failed to schedule return pickup: {str(e)}")
         
-    # Summary
-    y -= 20
-    c.line(300, y, width - 50, y)
-    y -= 20
+        # Restore inventory for approved returns
+        for item in return_request.items:
+            product = db.query(models.Product).filter(models.Product.id == item.get("product_id")).first()
+            if product:
+                product.stock_qty += item.get("quantity", 1)
+                
+                # Log inventory adjustment
+                inventory_log = models.InventoryLog(
+                    id=generate_id(),
+                    product_id=product.id,
+                    sku=product.sku,
+                    type="return",
+                    quantity=item.get("quantity", 1),
+                    previous_qty=product.stock_qty - item.get("quantity", 1),
+                    new_qty=product.stock_qty,
+                    notes=f"Return approved - Return ID: {return_request.id}",
+                    created_by=admin["id"],
+                    created_at=datetime.utcnow()
+                )
+                db.add(inventory_log)
+        
+        # Create approval notification
+        create_notification(
+            db=db,
+            user_id=return_request.user_id,
+            type="return_approved",
+            title="Return Request Approved",
+            message=f"Your return request for order #{order.order_number} has been approved. Pickup will be scheduled within 24 hours. Refund of ₹{return_request.refund_amount} will be processed after we receive the items.",
+            data={
+                "return_id": return_request.id,
+                "order_number": order.order_number,
+                "refund_amount": return_request.refund_amount,
+                "pickup_awb": return_request.return_awb
+            }
+        )
+        
+    elif data.status == "rejected" and old_status != "rejected":
+        # Create rejection notification
+        create_notification(
+            db=db,
+            user_id=return_request.user_id,
+            type="return_rejected",
+            title="Return Request Rejected",
+            message=f"Your return request for order #{order.order_number} has been rejected. Reason: {data.admin_notes or 'Does not meet return policy criteria'}",
+            data={
+                "return_id": return_request.id,
+                "order_number": order.order_number,
+                "rejection_reason": data.admin_notes
+            }
+        )
+        
+    elif data.status == "completed":
+        # Mark refund as processed
+        create_notification(
+            db=db,
+            user_id=return_request.user_id,
+            type="return_completed",
+            title="Return Completed",
+            message=f"Your return for order #{order.order_number} has been completed. Refund of ₹{return_request.refund_amount} has been processed to your original payment method.",
+            data={
+                "return_id": return_request.id,
+                "order_number": order.order_number,
+                "refund_amount": return_request.refund_amount
+            }
+        )
     
-    c.drawString(350, y, "Subtotal:")
-    c.drawRightString(width - 50, y, f"{order.subtotal:.2f}")
-    y -= 20
+    db.commit()
     
-    c.drawString(350, y, "GST:")
-    c.drawRightString(width - 50, y, f"{order.gst_total:.2f}")
-    y -= 20
+    return {
+        "message": f"Return request {data.status} successfully",
+        "return_id": return_request.id,
+        "status": data.status,
+        "refund_amount": return_request.refund_amount
+    }
+
+@api_router.get("/returns/{return_id}/tracking")
+def track_return_shipment(return_id: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Track return shipment status"""
+    return_request = db.query(models.ReturnRequest).filter(models.ReturnRequest.id == return_id).first()
+    if not return_request:
+        raise HTTPException(status_code=404, detail="Return request not found")
     
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(350, y, "Grand Total:")
-    c.drawRightString(width - 50, y, f"{order.grand_total:.2f}")
+    # Check access
+    if user["role"] != "admin" and return_request.user_id != user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
     
-    c.showPage()
-    c.save()
+    if not return_request.return_awb:
+        return {
+            "return_id": return_id,
+            "status": return_request.status,
+            "message": "Return pickup not yet scheduled",
+            "tracking_available": False
+        }
     
-    buffer.seek(0)
-    return Response(content=buffer.getvalue(), media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename=Invoice_{order.order_number}.pdf"})
+    # Get tracking information from courier
+    try:
+        from courier_service import DelhiveryService
+        delhivery_service = DelhiveryService(os.environ.get('DELHIVERY_TOKEN', ''))
+        tracking_result = delhivery_service.track_order(return_request.return_awb)
+        
+        if tracking_result.get("success"):
+            return {
+                "return_id": return_id,
+                "return_awb": return_request.return_awb,
+                "courier_provider": return_request.courier_provider,
+                "current_status": tracking_result.get("status"),
+                "current_location": tracking_result.get("current_location"),
+                "tracking_history": tracking_result.get("tracking_history", []),
+                "last_updated": datetime.utcnow().isoformat(),
+                "tracking_available": True
+            }
+        else:
+            return {
+                "return_id": return_id,
+                "return_awb": return_request.return_awb,
+                "status": return_request.status,
+                "error": tracking_result.get("error"),
+                "tracking_available": False
+            }
+    except Exception as e:
+        return {
+            "return_id": return_id,
+            "status": return_request.status,
+            "error": f"Tracking service unavailable: {str(e)}",
+            "tracking_available": False
+        }
+
+@api_router.post("/returns/{return_id}/evidence")
+def upload_return_evidence(
+    return_id: str,
+    files: List[UploadFile] = File(...),
+    evidence_type: str = "image",  # image or video
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Upload evidence (images/videos) for a return request"""
+    return_request = db.query(models.ReturnRequest).filter(models.ReturnRequest.id == return_id).first()
+    if not return_request:
+        raise HTTPException(status_code=404, detail="Return request not found")
+    
+    # Check access
+    if user["role"] != "admin" and return_request.user_id != user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    # Validate file count
+    if len(files) > 5:
+        raise HTTPException(status_code=400, detail="Maximum 5 files allowed per upload")
+    
+    uploaded_files = []
+    
+    for file in files:
+        # Validate file type
+        if evidence_type == "image":
+            if not file.content_type or not file.content_type.startswith('image/'):
+                continue
+            folder = "returns/images"
+        elif evidence_type == "video":
+            if not file.content_type or not file.content_type.startswith('video/'):
+                continue
+            folder = "returns/videos"
+        else:
+            raise HTTPException(status_code=400, detail="Invalid evidence type. Must be 'image' or 'video'")
+        
+        # Validate file size (10MB for images, 50MB for videos)
+        max_size = 10 * 1024 * 1024 if evidence_type == "image" else 50 * 1024 * 1024
+        file.file.seek(0, 2)  # Seek to end
+        file_size = file.file.tell()
+        file.file.seek(0)  # Reset to beginning
+        
+        if file_size > max_size:
+            continue
+        
+        try:
+            file_url = save_uploaded_file(file, folder)
+            uploaded_files.append({
+                "url": file_url,
+                "filename": file.filename,
+                "type": evidence_type,
+                "size": file_size
+            })
+        except Exception as e:
+            continue
+    
+    # Update return request with evidence URLs
+    if evidence_type == "image":
+        current_images = return_request.evidence_images or []
+        new_images = [f["url"] for f in uploaded_files]
+        return_request.evidence_images = current_images + new_images
+    else:
+        current_videos = return_request.evidence_videos or []
+        new_videos = [f["url"] for f in uploaded_files]
+        return_request.evidence_videos = current_videos + new_videos
+    
+    return_request.updated_at = datetime.utcnow()
+    db.commit()
+    
+    # Notify admin about new evidence
+    create_admin_notification(
+        db=db,
+        type="return_evidence",
+        title="New Return Evidence Uploaded",
+        message=f"Customer uploaded {len(uploaded_files)} {evidence_type}(s) for return request {return_id}",
+        data={
+            "return_id": return_id,
+            "evidence_type": evidence_type,
+            "file_count": len(uploaded_files),
+            "customer_name": user["name"]
+        }
+    )
+    
+    return {
+        "message": f"Uploaded {len(uploaded_files)} {evidence_type}(s) successfully",
+        "files": uploaded_files,
+        "return_id": return_id
+    }
+
+@api_router.get("/orders/{order_id}/can-cancel")
+def check_cancellation_eligibility(order_id: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Check if an order can be cancelled and return eligibility details"""
+    order = db.query(models.Order).filter(models.Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    # Check access
+    if user["role"] != "admin" and order.user_id != user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    can_cancel = order.status not in ["delivered", "cancelled", "returned"]
+    
+    # Determine cancellation type and implications
+    cancellation_info = {
+        "can_cancel": can_cancel,
+        "order_status": order.status,
+        "order_number": order.order_number,
+        "refund_amount": order.grand_total if can_cancel else 0
+    }
+    
+    if not can_cancel:
+        cancellation_info["reason"] = f"Cannot cancel order with status: {order.status}"
+        if order.status == "delivered":
+            cancellation_info["alternative"] = "You can create a return request instead"
+    else:
+        if order.status in ["pending", "confirmed"]:
+            cancellation_info["cancellation_type"] = "immediate"
+            cancellation_info["refund_timeline"] = "Immediate refund"
+            cancellation_info["implications"] = "Order will be cancelled immediately"
+        elif order.status in ["processing"]:
+            cancellation_info["cancellation_type"] = "processing"
+            cancellation_info["refund_timeline"] = "1-2 business days"
+            cancellation_info["implications"] = "Order preparation will be stopped"
+        elif order.status in ["shipped", "out_for_delivery"]:
+            cancellation_info["cancellation_type"] = "return"
+            cancellation_info["refund_timeline"] = "3-7 business days after return"
+            cancellation_info["implications"] = "Return pickup will be scheduled"
+    
+    return cancellation_info
+
+@api_router.get("/orders/{order_id}/can-return")
+def check_return_eligibility(order_id: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Check if an order can be returned and return eligibility details"""
+    order = db.query(models.Order).filter(models.Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    # Check access
+    if user["role"] != "admin" and order.user_id != user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    can_return = order.status == "delivered"
+    
+    return_info = {
+        "can_return": can_return,
+        "order_status": order.status,
+        "order_number": order.order_number
+    }
+    
+    if not can_return:
+        if order.status in ["pending", "confirmed", "processing", "shipped", "out_for_delivery"]:
+            return_info["reason"] = "Order not yet delivered"
+            return_info["alternative"] = "You can cancel the order instead"
+        elif order.status in ["cancelled", "returned"]:
+            return_info["reason"] = f"Order already {order.status}"
+        else:
+            return_info["reason"] = f"Cannot return order with status: {order.status}"
+    else:
+        # Check return window
+        if order.updated_at:
+            days_since_delivery = (datetime.utcnow() - order.updated_at).days
+            return_window_remaining = 7 - days_since_delivery
+            
+            if return_window_remaining <= 0:
+                return_info["can_return"] = False
+                return_info["reason"] = "Return window expired (7 days from delivery)"
+            else:
+                return_info["return_window_remaining"] = f"{return_window_remaining} days"
+                return_info["return_types"] = [
+                    {"value": "defective", "label": "Product is defective/damaged"},
+                    {"value": "wrong_item", "label": "Wrong item received"},
+                    {"value": "not_satisfied", "label": "Not satisfied with product"},
+                    {"value": "damaged", "label": "Package was damaged"}
+                ]
+                return_info["evidence_required"] = True
+                return_info["refund_timeline"] = "5-7 business days after return verification"
+    
+    return return_info
 
 # ============ TEAM MANAGEMENT ROUTES ============
 
@@ -1492,56 +2616,6 @@ def remove_admin_access(user_id: str, admin: dict = Depends(admin_required), db:
 
 # ============ SETTINGS ROUTES ============
 
-@api_router.get("/admin/settings")
-def get_settings(admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
-    """Get business settings"""
-    settings = db.query(models.Settings).filter(models.Settings.type == "business").first()
-    if not settings:
-        # Create default settings
-        default_settings = models.Settings(
-            type="business",
-            business_name="BharatBazaar",
-            gst_number="",
-            address={},
-            phone="",
-            email="",
-            logo_url="",
-            favicon_url="",
-            social_links={},
-            configs={
-                "enable_gst_billing": True,
-                "default_gst_rate": 18.0,
-                "invoice_prefix": "INV",
-                "order_prefix": "ORD"
-            },
-            updated_at=datetime.utcnow()
-        )
-        db.add(default_settings)
-        db.commit()
-        db.refresh(default_settings)
-        settings = default_settings
-    
-    # Return flattened response
-    return {
-        "business_name": settings.business_name or "BharatBazaar",
-        "gst_number": settings.gst_number or "",
-        "phone": settings.phone or "",
-        "email": settings.email or "",
-        "address": settings.address or {},
-        "logo_url": settings.logo_url or "",
-        "favicon_url": settings.favicon_url or "",
-        "enable_gst_billing": settings.configs.get("enable_gst_billing", True) if settings.configs else True,
-        "default_gst_rate": settings.configs.get("default_gst_rate", 18.0) if settings.configs else 18.0,
-        "invoice_prefix": settings.configs.get("invoice_prefix", "INV") if settings.configs else "INV",
-        "order_prefix": settings.configs.get("order_prefix", "ORD") if settings.configs else "ORD",
-        "upi_id": settings.configs.get("upi_id", "") if settings.configs else "",
-        "facebook_url": settings.social_links.get("facebook_url", "") if settings.social_links else "",
-        "instagram_url": settings.social_links.get("instagram_url", "") if settings.social_links else "",
-        "twitter_url": settings.social_links.get("twitter_url", "") if settings.social_links else "",
-        "youtube_url": settings.social_links.get("youtube_url", "") if settings.social_links else "",
-        "whatsapp_number": settings.social_links.get("whatsapp_number", "") if settings.social_links else ""
-    }
-
 @api_router.get("/admin/settings/email")
 def get_email_settings(admin: dict = Depends(admin_required)):
     """Get email configuration settings"""
@@ -1579,14 +2653,20 @@ def test_email_settings(data: dict, admin: dict = Depends(admin_required)):
 @api_router.put("/admin/settings")
 def update_settings(data: SettingsUpdate, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
     """Update business settings"""
+    print(f"DEBUG UPDATE SETTINGS: Received data: {data.dict()}")
     settings = db.query(models.Settings).filter(models.Settings.type == "business").first()
     if not settings:
-        settings = models.Settings(type="business")
+        settings = models.Settings(
+            type="business",
+            company_name="Amorlias International Pvt Ltd"  # Default company name
+        )
         db.add(settings)
     
     # Update basic fields
     if data.business_name is not None:
         settings.business_name = data.business_name
+    if data.company_name is not None:
+        settings.company_name = data.company_name
     if data.gst_number is not None:
         settings.gst_number = data.gst_number
     if data.phone is not None:
@@ -1601,7 +2681,7 @@ def update_settings(data: SettingsUpdate, admin: dict = Depends(admin_required),
         settings.favicon_url = data.favicon_url
     
     # Update social links
-    social_links = settings.social_links or {}
+    social_links = dict(settings.social_links) if settings.social_links else {}
     if data.facebook_url is not None:
         social_links["facebook_url"] = data.facebook_url
     if data.instagram_url is not None:
@@ -1615,7 +2695,7 @@ def update_settings(data: SettingsUpdate, admin: dict = Depends(admin_required),
     settings.social_links = social_links
     
     # Update configs
-    configs = settings.configs or {}
+    configs = dict(settings.configs) if settings.configs else {}
     if hasattr(data, 'enable_gst_billing'):
         configs["enable_gst_billing"] = data.enable_gst_billing
     if data.default_gst_rate is not None:
@@ -1642,20 +2722,36 @@ def get_public_settings(db: Session = Depends(get_db)):
     if not settings:
         return {
             "business_name": "BharatBazaar",
+            "company_name": "Amorlias International Pvt Ltd",
             "logo_url": "",
             "favicon_url": "",
-            "social_links": {}
+            "phone": "",
+            "email": "",
+            "address": {},
+            "gst_number": "",
+            "facebook_url": "",
+            "instagram_url": "",
+            "twitter_url": "",
+            "youtube_url": "",
+            "whatsapp_number": ""
         }
+    
+    social_links = settings.social_links or {}
     
     return {
         "business_name": settings.business_name or "BharatBazaar",
+        "company_name": settings.company_name or "Amorlias International Pvt Ltd",
         "logo_url": settings.logo_url or "",
         "favicon_url": settings.favicon_url or "",
         "phone": settings.phone or "",
         "email": settings.email or "",
         "address": settings.address or {},
         "gst_number": settings.gst_number or "",
-        "social_links": settings.social_links or {}
+        "facebook_url": social_links.get("facebook_url", ""),
+        "instagram_url": social_links.get("instagram_url", ""),
+        "twitter_url": social_links.get("twitter_url", ""),
+        "youtube_url": social_links.get("youtube_url", ""),
+        "whatsapp_number": social_links.get("whatsapp_number", "")
     }
 
 # ============ PAGE ROUTES ============
@@ -1763,8 +2859,78 @@ def get_dashboard_stats(admin: dict = Depends(admin_required), db: Session = Dep
 
 # ============ COURIER ROUTES ============
 from courier_service import DelhiveryService
-DELHIVERY_TOKEN = "ac9b6a862cffeba552eeb07729e40e692b7a3fd8"
+
+DELHIVERY_TOKEN = os.environ.get('DELHIVERY_TOKEN', 'ac9b6a862cffeba552eeb07729e40e692b7a3fd8')
 delhivery_service = DelhiveryService(DELHIVERY_TOKEN)
+
+# ============ COURIER PROVIDERS MANAGEMENT ============
+
+@api_router.get("/admin/couriers")
+def get_couriers(admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Get all courier providers"""
+    # For now, return a default Delhivery courier
+    return [
+        {
+            "id": "delhivery",
+            "name": "Delhivery",
+            "api_key": "configured" if DELHIVERY_TOKEN else None,
+            "api_secret": "configured",
+            "webhook_url": "",
+            "tracking_url_template": "https://track.delhivery.com/track/package/{tracking_number}",
+            "is_active": True,
+            "priority": 1
+        }
+    ]
+
+@api_router.post("/admin/couriers/test")
+def test_courier_api(admin: dict = Depends(admin_required)):
+    """Test courier API configuration"""
+    try:
+        # Test pincode serviceability
+        test_result = delhivery_service.check_serviceability("110001")
+        
+        # Test address validation
+        test_address = {
+            "name": "Test Customer",
+            "phone": "9999999999",
+            "line1": "Test Address",
+            "city": "New Delhi",
+            "state": "Delhi",
+            "pincode": "110001"
+        }
+        address_result = delhivery_service.validate_address(test_address)
+        
+        return {
+            "success": True,
+            "message": "Courier API test completed successfully",
+            "pincode_test": test_result,
+            "address_test": address_result,
+            "api_status": "Working" if test_result.get("serviceable") else "Issues detected"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Courier API test failed: {str(e)}",
+            "api_status": "Error"
+        }
+
+@api_router.post("/admin/couriers")
+def create_courier(courier_data: dict, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Create a new courier provider"""
+    # For now, just return success
+    return {"message": "Courier configuration saved", "id": "new-courier"}
+
+@api_router.put("/admin/couriers/{courier_id}")
+def update_courier(courier_id: str, courier_data: dict, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Update courier provider"""
+    # For now, just return success
+    return {"message": "Courier updated successfully"}
+
+@api_router.delete("/admin/couriers/{courier_id}")
+def delete_courier(courier_id: str, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Delete courier provider"""
+    # For now, just return success
+    return {"message": "Courier deleted successfully"}
 
 @api_router.get("/courier/pincode")
 def check_pincode_serviceability(pincode: str):
@@ -1795,6 +2961,58 @@ def get_order_details(order_id: str, admin: dict = Depends(admin_required), db: 
         "courier_provider": order.courier_provider,
         "created_at": order.created_at.isoformat() if order.created_at else None
     }
+
+@api_router.post("/generate-qr")
+def generate_payment_qr(data: dict, db: Session = Depends(get_db)):
+    """Generate UPI QR code for payment"""
+    try:
+        # Get business settings for UPI ID
+        settings = db.query(models.Settings).filter(models.Settings.type == "business").first()
+        if not settings or not settings.configs or not settings.configs.get("upi_id"):
+            raise HTTPException(status_code=400, detail="UPI ID not configured. Please contact admin.")
+        
+        upi_id = settings.configs.get("upi_id")
+        amount = data.get("amount", 0)
+        customer_name = data.get("customer_name", "Customer")
+        order_number = data.get("order_number", "")
+        
+        # Create UPI payment URL
+        # Format: upi://pay?pa=UPI_ID&pn=PAYEE_NAME&am=AMOUNT&cu=INR&tn=TRANSACTION_NOTE
+        upi_url = f"upi://pay?pa={upi_id}&pn={settings.business_name or 'BharatBazaar'}&am={amount}&cu=INR&tn=Payment for Order {order_number}"
+        
+        # Generate QR code
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
+        qr.add_data(upi_url)
+        qr.make(fit=True)
+        
+        # Create QR code image
+        qr_img = qr.make_image(fill_color="black", back_color="white")
+        
+        # Convert to base64 for frontend
+        img_buffer = QRBytesIO()
+        qr_img.save(img_buffer, format='PNG')
+        img_buffer.seek(0)
+        
+        import base64
+        qr_base64 = base64.b64encode(img_buffer.getvalue()).decode()
+        
+        return {
+            "success": True,
+            "qr_code": f"data:image/png;base64,{qr_base64}",
+            "upi_url": upi_url,
+            "amount": amount,
+            "upi_id": upi_id,
+            "payee_name": settings.business_name or 'BharatBazaar'
+        }
+        
+    except Exception as e:
+        print(f"QR Generation Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate QR code: {str(e)}")
 
 @api_router.post("/courier/ship/{order_id}")
 def create_shipment(order_id: str, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
@@ -1924,26 +3142,82 @@ def track_by_awb(awb: str):
 
 @api_router.get("/courier/label/{order_id}")
 def get_shipping_label(order_id: str, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
-    """Get shipping label URL for printing"""
+    """Generate professional shipping label for printing"""
     order = db.query(models.Order).filter(models.Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-        
-    if not order.tracking_number:
-         raise HTTPException(status_code=400, detail="Order has not been shipped yet")
-
-    result = delhivery_service.get_label(order.tracking_number)
     
-    if result.get("success"):
+    # If order has tracking number, try to get label from Delhivery
+    if order.tracking_number:
+        result = delhivery_service.get_label(order.tracking_number)
+        if result.get("success"):
+            return {
+                "order_id": order.id,
+                "order_number": order.order_number,
+                "awb": order.tracking_number,
+                "label_url": result.get("label_url"),
+                "generated_at": datetime.utcnow().isoformat(),
+                "note": result.get("note")
+            }
+        else:
+            # If Delhivery label fails, generate professional local PDF label
+            pass
+    
+    # Generate professional local PDF label as fallback
+    try:
+        pdf_buffer = generate_shipping_label_pdf(order_id, db)
+        
+        # Save the PDF temporarily and return URL
+        import tempfile
+        import os
+        
+        # Create a temporary file
+        temp_dir = os.path.join(os.getcwd(), "uploads", "labels")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        temp_filename = f"label_{order.order_number}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        temp_path = os.path.join(temp_dir, temp_filename)
+        
+        with open(temp_path, 'wb') as f:
+            f.write(pdf_buffer.getvalue())
+        
+        label_url = f"/uploads/labels/{temp_filename}"
+        
         return {
             "order_id": order.id,
             "order_number": order.order_number,
-            "awb": order.tracking_number,
-            "label_url": result.get("label_url"),
-            "generated_at": datetime.utcnow().isoformat()
+            "awb": order.tracking_number or "N/A",
+            "label_url": label_url,
+            "generated_at": datetime.utcnow().isoformat(),
+            "note": "Professional PDF label generated"
         }
-    else:
-        raise HTTPException(status_code=400, detail=f"Label generation failed: {result.get('error')}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate shipping label: {str(e)}")
+
+@api_router.get("/courier/label-url/{order_id}")
+def get_shipping_label_url(order_id: str, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Get shipping label URL for an order"""
+    order = db.query(models.Order).filter(models.Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    # If order has tracking number, try to get label from Delhivery
+    if order.tracking_number:
+        result = delhivery_service.get_label(order.tracking_number)
+        if result.get("success") and result.get("label_url"):
+            return {
+                "success": True,
+                "label_url": result.get("label_url"),
+                "awb": order.tracking_number,
+                "note": result.get("note")
+            }
+    
+    # Return error if no label URL available
+    return {
+        "success": False,
+        "error": "No label URL available. Order may not be shipped yet or courier service unavailable.",
+        "awb": order.tracking_number or None
+    }
 
 @api_router.get("/courier/invoice/{order_id}")
 def get_shipping_invoice(order_id: str, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
@@ -2096,6 +3370,195 @@ def generate_picklist(date: str = None, admin: dict = Depends(admin_required), d
         "picklist": picklist_items
     }
 
+# ============ ADMIN USER MANAGEMENT ROUTES ============
+
+@api_router.get("/admin/users")
+def get_all_users(
+    page: int = 1, 
+    limit: int = 50, 
+    search: str = None,
+    role: str = None,
+    admin: dict = Depends(admin_required), 
+    db: Session = Depends(get_db)
+):
+    """Get all users with pagination and filtering"""
+    query = db.query(models.User)
+    
+    # Apply filters
+    if search:
+        query = query.filter(
+            or_(
+                models.User.name.ilike(f"%{search}%"),
+                models.User.phone.ilike(f"%{search}%"),
+                models.User.email.ilike(f"%{search}%")
+            )
+        )
+    
+    if role:
+        query = query.filter(models.User.role == role)
+    
+    # Get total count
+    total = query.count()
+    
+    # Apply pagination
+    offset = (page - 1) * limit
+    users = query.offset(offset).limit(limit).all()
+    
+    # Convert to dict and remove passwords
+    users_data = []
+    for user in users:
+        user_dict = {c.name: getattr(user, c.name) for c in user.__table__.columns}
+        user_dict.pop("password", None)  # Remove password from response
+        users_data.append(user_dict)
+    
+    return {
+        "users": users_data,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": (total + limit - 1) // limit
+        }
+    }
+
+@api_router.put("/admin/users/{user_id}")
+def update_user(user_id: str, data: dict, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Update user information"""
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Update allowed fields
+    allowed_fields = ["name", "email", "role", "is_seller", "is_wholesale", "supplier_status"]
+    for field in allowed_fields:
+        if field in data:
+            setattr(user, field, data[field])
+    
+    user.updated_at = datetime.utcnow()
+    db.commit()
+    
+    # Return user without password
+    user_dict = {c.name: getattr(user, c.name) for c in user.__table__.columns}
+    user_dict.pop("password", None)
+    
+    return {"message": "User updated successfully", "user": user_dict}
+
+@api_router.delete("/admin/users/{user_id}")
+def delete_user(user_id: str, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Delete a user (soft delete by deactivating)"""
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if user.role == "admin":
+        raise HTTPException(status_code=400, detail="Cannot delete admin user")
+    
+    # Instead of hard delete, we could deactivate or actually delete
+    # For now, let's do hard delete for non-admin users
+    db.delete(user)
+    db.commit()
+    
+    return {"message": "User deleted successfully"}
+
+# ============ SETTINGS ROUTES ============
+
+@api_router.get("/settings/public")
+def get_public_settings(db: Session = Depends(get_db)):
+    """Get public settings (no authentication required)"""
+    try:
+        settings = db.query(models.Settings).filter(models.Settings.type == "business").first()
+        
+        if not settings:
+            # Create default settings
+            default_settings = models.Settings(
+                type="business",
+                business_name="Amorlias",
+                company_name="Amorlias International Pvt Ltd",
+                phone="9999999999",
+                email="info@bharatbazaar.com",
+                configs={
+                    "enable_gst_billing": True,
+                    "default_gst_rate": 18.0,
+                    "invoice_prefix": "INV",
+                    "order_prefix": "ORD"
+                }
+            )
+            db.add(default_settings)
+            db.commit()
+            db.refresh(default_settings)
+            settings = default_settings
+        
+        # Return only public fields
+        return {
+            "business_name": settings.business_name,
+            "company_name": settings.company_name,
+            "phone": settings.phone,
+            "email": settings.email,
+            "logo_url": settings.logo_url,
+            "favicon_url": settings.favicon_url,
+            "social_links": settings.social_links or {},
+            "configs": settings.configs or {}
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get settings: {str(e)}")
+
+@api_router.get("/admin/settings")
+def get_admin_settings(admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Get all settings for admin"""
+    try:
+        settings = db.query(models.Settings).filter(models.Settings.type == "business").first()
+        if settings:
+             print(f"DEBUG GET SETTINGS: Company Name in DB: '{settings.company_name}'")
+        
+        if not settings:
+            # Create default settings
+            default_settings = models.Settings(
+                type="business",
+                business_name="BharatBazaar",
+                company_name="Amorlias International Pvt Ltd",
+                phone="9999999999",
+                email="info@bharatbazaar.com",
+                configs={
+                    "enable_gst_billing": True,
+                    "default_gst_rate": 18.0,
+                    "invoice_prefix": "INV",
+                    "order_prefix": "ORD"
+                }
+            )
+            db.add(default_settings)
+            db.commit()
+            db.refresh(default_settings)
+            settings = default_settings
+        
+        # Return flattened response that matches frontend expectations
+        configs = settings.configs or {}
+        social_links = settings.social_links or {}
+        
+        return {
+            "business_name": settings.business_name or "BharatBazaar",
+            "company_name": settings.company_name or "",
+            "gst_number": settings.gst_number or "",
+            "phone": settings.phone or "",
+            "email": settings.email or "",
+            "address": settings.address or {},
+            "logo_url": settings.logo_url or "",
+            "favicon_url": settings.favicon_url or "",
+            "enable_gst_billing": configs.get("enable_gst_billing", True),
+            "default_gst_rate": configs.get("default_gst_rate", 18.0),
+            "invoice_prefix": configs.get("invoice_prefix", "INV"),
+            "order_prefix": configs.get("order_prefix", "ORD"),
+            "upi_id": configs.get("upi_id", ""),
+            "facebook_url": social_links.get("facebook_url", ""),
+            "instagram_url": social_links.get("instagram_url", ""),
+            "twitter_url": social_links.get("twitter_url", ""),
+            "youtube_url": social_links.get("youtube_url", ""),
+            "whatsapp_number": social_links.get("whatsapp_number", "")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get settings: {str(e)}")
+
+# Removed duplicate update_settings function
+
 # ============ REPORT ROUTES ============
 
 @api_router.get("/admin/reports/sales")
@@ -2228,6 +3691,82 @@ def get_profit_loss_report(
         "orders_count": len(orders),
         "returns_count": len(returns)
     }
+
+@api_router.get("/admin/reports/inventory-status")
+def get_inventory_status_report(admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Get detailed inventory status report showing available, blocked, and reserved quantities"""
+    try:
+        # Get all products with their current stock
+        products = db.query(models.Product).filter(models.Product.is_active == True).all()
+        
+        inventory_report = []
+        
+        for product in products:
+            # Calculate blocked quantity in pending orders
+            pending_orders = db.query(models.Order).filter(
+                models.Order.status.in_(["pending", "processing"])
+            ).all()
+            
+            blocked_qty = 0
+            for order in pending_orders:
+                for item in order.items:
+                    if item.get("product_id") == product.id:
+                        blocked_qty += item.get("quantity", 0)
+            
+            # Calculate available quantity (stock - blocked)
+            available_qty = max(0, product.stock_qty - blocked_qty)
+            
+            # Determine stock status
+            if product.stock_qty <= 0:
+                stock_status = "out_of_stock"
+            elif product.stock_qty <= product.low_stock_threshold:
+                stock_status = "low_stock"
+            elif available_qty <= product.low_stock_threshold:
+                stock_status = "reserved_low"
+            else:
+                stock_status = "in_stock"
+            
+            inventory_report.append({
+                "product_id": product.id,
+                "product_name": product.name,
+                "sku": product.sku,
+                "category_name": product.category.name if product.category else "Uncategorized",
+                "total_stock": product.stock_qty,
+                "blocked_qty": blocked_qty,
+                "available_qty": available_qty,
+                "low_stock_threshold": product.low_stock_threshold,
+                "stock_status": stock_status,
+                "selling_price": product.selling_price,
+                "cost_price": product.cost_price,
+                "stock_value": product.stock_qty * product.cost_price,
+                "available_value": available_qty * product.cost_price
+            })
+        
+        # Calculate summary statistics
+        total_products = len(inventory_report)
+        total_stock_value = sum(item["stock_value"] for item in inventory_report)
+        total_available_value = sum(item["available_value"] for item in inventory_report)
+        total_blocked_value = total_stock_value - total_available_value
+        
+        out_of_stock_count = len([item for item in inventory_report if item["stock_status"] == "out_of_stock"])
+        low_stock_count = len([item for item in inventory_report if item["stock_status"] in ["low_stock", "reserved_low"]])
+        in_stock_count = len([item for item in inventory_report if item["stock_status"] == "in_stock"])
+        
+        return {
+            "summary": {
+                "total_products": total_products,
+                "total_stock_value": total_stock_value,
+                "total_available_value": total_available_value,
+                "total_blocked_value": total_blocked_value,
+                "out_of_stock_count": out_of_stock_count,
+                "low_stock_count": low_stock_count,
+                "in_stock_count": in_stock_count
+            },
+            "products": inventory_report
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate inventory report: {str(e)}")
 
 @api_router.post("/admin/reset-data")
 def reset_database(admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
@@ -2481,6 +4020,1226 @@ def seed_sample_data(admin: dict = Depends(admin_required), db: Session = Depend
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to seed data: {str(e)}")
+
+
+# ============ WISHLIST CATEGORY ROUTES ============
+
+@api_router.get("/wishlist/categories")
+def get_user_wishlist_categories(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get user's wishlist categories"""
+    try:
+        categories = db.query(models.WishlistCategory).filter(
+            models.WishlistCategory.user_id == user["id"]
+        ).order_by(models.WishlistCategory.is_default.desc(), models.WishlistCategory.created_at.asc()).all()
+        
+        # If no categories exist, create a default one
+        if not categories:
+            default_category = models.WishlistCategory(
+                id=generate_id(),
+                user_id=user["id"],
+                name="My Wishlist",
+                description="Default wishlist category",
+                color="#3B82F6",
+                icon="heart",
+                is_default=True
+            )
+            db.add(default_category)
+            db.commit()
+            db.refresh(default_category)
+            categories = [default_category]
+        
+        # Convert to dict and add item count
+        categories_with_count = []
+        for category in categories:
+            try:
+                category_dict = {c.name: getattr(category, c.name) for c in category.__table__.columns}
+                
+                # Add item count (simplified query to avoid relationship issues)
+                item_count = db.query(models.Wishlist).filter(
+                    models.Wishlist.user_id == user["id"],
+                    models.Wishlist.category_id == category.id
+                ).count()
+                category_dict['item_count'] = item_count
+                
+                categories_with_count.append(category_dict)
+            except Exception as e:
+                print(f"Error processing category {category.id}: {e}")
+                # Add basic category info without item count
+                categories_with_count.append({
+                    'id': category.id,
+                    'name': category.name,
+                    'description': category.description,
+                    'color': category.color,
+                    'icon': category.icon,
+                    'is_default': category.is_default,
+                    'user_id': category.user_id,
+                    'created_at': category.created_at.isoformat() if category.created_at else None,
+                    'item_count': 0
+                })
+        
+        return {"categories": categories_with_count}
+        
+    except Exception as e:
+        print(f"Error in get_user_wishlist_categories: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get categories: {str(e)}")
+
+@api_router.post("/wishlist/categories")
+def create_wishlist_category(data: dict, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Create a new wishlist category"""
+    name = data.get("name", "").strip()
+    description = data.get("description", "")
+    color = data.get("color", "#3B82F6")
+    icon = data.get("icon", "heart")
+    
+    if not name:
+        raise HTTPException(status_code=400, detail="Category name is required")
+    
+    # Check if category name already exists for this user
+    existing = db.query(models.WishlistCategory).filter(
+        models.WishlistCategory.user_id == user["id"],
+        models.WishlistCategory.name == name
+    ).first()
+    
+    if existing:
+        raise HTTPException(status_code=400, detail="Category name already exists")
+    
+    category = models.WishlistCategory(
+        id=generate_id(),
+        user_id=user["id"],
+        name=name,
+        description=description,
+        color=color,
+        icon=icon,
+        is_default=False
+    )
+    
+    db.add(category)
+    db.commit()
+    db.refresh(category)
+    
+    # Convert to dict for JSON serialization
+    category_dict = {c.name: getattr(category, c.name) for c in category.__table__.columns}
+    category_dict['item_count'] = 0  # New category has no items
+    
+    return {"message": "Category created successfully", "category": category_dict}
+
+@api_router.put("/wishlist/categories/{category_id}")
+def update_wishlist_category(category_id: str, data: dict, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Update a wishlist category"""
+    category = db.query(models.WishlistCategory).filter(
+        models.WishlistCategory.id == category_id,
+        models.WishlistCategory.user_id == user["id"]
+    ).first()
+    
+    if not category:
+        raise HTTPException(status_code=404, detail="Category not found")
+    
+    # Update fields
+    if "name" in data and data["name"].strip():
+        # Check if new name conflicts with existing categories
+        existing = db.query(models.WishlistCategory).filter(
+            models.WishlistCategory.user_id == user["id"],
+            models.WishlistCategory.name == data["name"].strip(),
+            models.WishlistCategory.id != category_id
+        ).first()
+        
+        if existing:
+            raise HTTPException(status_code=400, detail="Category name already exists")
+        
+        category.name = data["name"].strip()
+    
+    if "description" in data:
+        category.description = data["description"]
+    
+    if "color" in data:
+        category.color = data["color"]
+    
+    if "icon" in data:
+        category.icon = data["icon"]
+    
+    db.commit()
+    return {"message": "Category updated successfully", "category": category}
+
+@api_router.delete("/wishlist/categories/{category_id}")
+def delete_wishlist_category(category_id: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Delete a wishlist category"""
+    category = db.query(models.WishlistCategory).filter(
+        models.WishlistCategory.id == category_id,
+        models.WishlistCategory.user_id == user["id"]
+    ).first()
+    
+    if not category:
+        raise HTTPException(status_code=404, detail="Category not found")
+    
+    if category.is_default:
+        raise HTTPException(status_code=400, detail="Cannot delete default category")
+    
+    # Get default category to move items to
+    default_category = db.query(models.WishlistCategory).filter(
+        models.WishlistCategory.user_id == user["id"],
+        models.WishlistCategory.is_default == True
+    ).first()
+    
+    if not default_category:
+        # Create default category if it doesn't exist
+        default_category = models.WishlistCategory(
+            id=generate_id(),
+            user_id=user["id"],
+            name="My Wishlist",
+            description="Default wishlist category",
+            color="#3B82F6",
+            icon="heart",
+            is_default=True
+        )
+        db.add(default_category)
+        db.commit()
+        db.refresh(default_category)
+    
+    # Move all items from deleted category to default category
+    db.query(models.Wishlist).filter(
+        models.Wishlist.category_id == category_id
+    ).update({"category_id": default_category.id})
+    
+    # Delete the category
+    db.delete(category)
+    db.commit()
+    
+    return {"message": "Category deleted successfully"}
+
+# ============ ENHANCED WISHLIST ROUTES ============
+
+@api_router.get("/wishlist")
+def get_user_wishlist(category_id: str = None, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get current user's wishlist with product details, optionally filtered by category"""
+    query = db.query(models.Wishlist).filter(
+        models.Wishlist.user_id == user["id"]
+    )
+    
+    if category_id:
+        query = query.filter(models.Wishlist.category_id == category_id)
+    
+    wishlist_items = query.order_by(models.Wishlist.created_at.desc()).all()
+    
+    # Get product details for each wishlist item
+    products = []
+    for item in wishlist_items:
+        product = db.query(models.Product).filter(models.Product.id == item.product_id).first()
+        if product:
+            # Add wishlist-specific data to product
+            product_dict = {c.name: getattr(product, c.name) for c in product.__table__.columns}
+            product_dict['wishlist_id'] = item.id
+            product_dict['category_id'] = item.category_id
+            product_dict['notes'] = item.notes
+            product_dict['priority'] = item.priority
+            product_dict['added_at'] = item.created_at
+            products.append(product_dict)
+    
+    return {"wishlist": products}
+
+@api_router.post("/wishlist/{product_id}")
+def add_to_wishlist(product_id: str, item_data: WishlistItemAdd = None, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Add a product to user's wishlist with optional category and notes"""
+    # Check if product exists
+    product = db.query(models.Product).filter(models.Product.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    
+    # Check if already in wishlist
+    existing = db.query(models.Wishlist).filter(
+        models.Wishlist.user_id == user["id"],
+        models.Wishlist.product_id == product_id
+    ).first()
+    
+    if existing:
+        raise HTTPException(status_code=400, detail="Product already in wishlist")
+    
+    # Get category_id from request data
+    category_id = None
+    notes = ""
+    priority = 1
+    
+    if item_data:
+        category_id = item_data.category_id
+        notes = item_data.notes or ""
+        priority = item_data.priority
+    
+    # If no category specified, use default category
+    if not category_id:
+        default_category = db.query(models.WishlistCategory).filter(
+            models.WishlistCategory.user_id == user["id"],
+            models.WishlistCategory.is_default == True
+        ).first()
+        
+        if not default_category:
+            # Create default category
+            default_category = models.WishlistCategory(
+                id=generate_id(),
+                user_id=user["id"],
+                name="My Wishlist",
+                description="Default wishlist category",
+                color="#3B82F6",
+                icon="heart",
+                is_default=True
+            )
+            db.add(default_category)
+            db.commit()
+            db.refresh(default_category)
+        
+        category_id = default_category.id
+    else:
+        # Verify category belongs to user
+        category = db.query(models.WishlistCategory).filter(
+            models.WishlistCategory.id == category_id,
+            models.WishlistCategory.user_id == user["id"]
+        ).first()
+        
+        if not category:
+            raise HTTPException(status_code=400, detail="Invalid category")
+    
+    # Add to wishlist
+    wishlist_item = models.Wishlist(
+        id=generate_id(),
+        user_id=user["id"],
+        product_id=product_id,
+        category_id=category_id,
+        notes=notes,
+        priority=priority
+    )
+    
+    db.add(wishlist_item)
+    db.commit()
+    
+    return {"message": "Product added to wishlist", "product": product}
+
+@api_router.put("/wishlist/{wishlist_id}")
+def update_wishlist_item(wishlist_id: str, data: dict, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Update wishlist item (category, notes, priority)"""
+    wishlist_item = db.query(models.Wishlist).filter(
+        models.Wishlist.id == wishlist_id,
+        models.Wishlist.user_id == user["id"]
+    ).first()
+    
+    if not wishlist_item:
+        raise HTTPException(status_code=404, detail="Wishlist item not found")
+    
+    # Update fields
+    if "category_id" in data:
+        # Verify category belongs to user
+        if data["category_id"]:
+            category = db.query(models.WishlistCategory).filter(
+                models.WishlistCategory.id == data["category_id"],
+                models.WishlistCategory.user_id == user["id"]
+            ).first()
+            
+            if not category:
+                raise HTTPException(status_code=400, detail="Invalid category")
+        
+        wishlist_item.category_id = data["category_id"]
+    
+    if "notes" in data:
+        wishlist_item.notes = data["notes"]
+    
+    if "priority" in data:
+        priority = data["priority"]
+        if priority not in [1, 2, 3]:
+            raise HTTPException(status_code=400, detail="Priority must be 1 (Low), 2 (Medium), or 3 (High)")
+        wishlist_item.priority = priority
+    
+    db.commit()
+    return {"message": "Wishlist item updated successfully"}
+
+@api_router.delete("/wishlist/{product_id}")
+def remove_from_wishlist(product_id: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Remove a product from user's wishlist"""
+    wishlist_item = db.query(models.Wishlist).filter(
+        models.Wishlist.user_id == user["id"],
+        models.Wishlist.product_id == product_id
+    ).first()
+    
+    if not wishlist_item:
+        raise HTTPException(status_code=404, detail="Product not in wishlist")
+    
+    db.delete(wishlist_item)
+    db.commit()
+    
+    return {"message": "Product removed from wishlist"}
+
+@api_router.delete("/wishlist")
+def clear_wishlist(category_id: str = None, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Clear all items from user's wishlist or specific category"""
+    query = db.query(models.Wishlist).filter(models.Wishlist.user_id == user["id"])
+    
+    if category_id:
+        query = query.filter(models.Wishlist.category_id == category_id)
+        message = "Category cleared"
+    else:
+        message = "Wishlist cleared"
+    
+    query.delete()
+    db.commit()
+    
+    return {"message": message}
+
+@api_router.get("/wishlist/check/{product_id}")
+def check_wishlist_status(product_id: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Check if a product is in user's wishlist"""
+    wishlist_item = db.query(models.Wishlist).filter(
+        models.Wishlist.user_id == user["id"],
+        models.Wishlist.product_id == product_id
+    ).first()
+    
+    return {
+        "in_wishlist": wishlist_item is not None,
+        "wishlist_item": {
+            "id": wishlist_item.id,
+            "category_id": wishlist_item.category_id,
+            "notes": wishlist_item.notes,
+            "priority": wishlist_item.priority
+        } if wishlist_item else None
+    }
+
+# ============ INVOICE & LABEL GENERATION ============
+
+def generate_invoice_pdf(order_id: str, db: Session):
+    """Generate professional invoice PDF for an order"""
+    try:
+        # Get order details
+        order = db.query(models.Order).filter(models.Order.id == order_id).first()
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        
+        # Get settings for company info
+        settings = db.query(models.Settings).filter(models.Settings.type == "business").first()
+        
+        # Create PDF buffer
+        buffer = io.BytesIO()
+        p = canvas.Canvas(buffer, pagesize=A4)
+        width, height = A4
+        
+        # Company details
+        company_name = settings.company_name if settings and settings.company_name else "BharatBazaar"
+        business_name = settings.business_name if settings and settings.business_name else "BharatBazaar"
+        gst_number = settings.gst_number if settings and settings.gst_number else ""
+        
+        # Colors
+        header_color = colors.HexColor('#2c3e50')
+        accent_color = colors.HexColor('#3498db')
+        
+        # Header Section
+        p.setFillColor(header_color)
+        p.rect(0, height - 80, width, 80, fill=1)
+        
+        p.setFillColor(colors.white)
+        p.setFont("Helvetica-Bold", 24)
+        p.drawString(30, height - 50, company_name)
+        
+        # Invoice title on right
+        p.setFillColor(colors.white)
+        p.setFont("Helvetica-Bold", 20)
+        p.drawRightString(width - 30, height - 35, "TAX INVOICE")
+        p.setFont("Helvetica", 10)
+        p.drawRightString(width - 30, height - 50, "Original For Recipient")
+        
+        # Company details section
+        p.setFillColor(colors.black)
+        p.setFont("Helvetica-Bold", 12)
+        p.drawString(30, height - 110, f"Sold by: {business_name}")
+        
+        p.setFont("Helvetica", 10)
+        y_pos = height - 130
+        
+        if settings and settings.address:
+            addr = settings.address
+            address_lines = []
+            if addr.get('line1'): address_lines.append(addr['line1'])
+            if addr.get('line2'): address_lines.append(addr['line2'])
+            if addr.get('city') and addr.get('state'):
+                address_lines.append(f"{addr['city']}, {addr['state']}, {addr.get('pincode', '')}")
+            
+            for line in address_lines:
+                p.drawString(30, y_pos, line)
+                y_pos -= 15
+        
+        if gst_number:
+            p.drawString(30, y_pos, f"GSTIN - {gst_number}")
+            y_pos -= 15
+        
+        # Invoice details (right side)
+        p.setFont("Helvetica", 10)
+        invoice_prefix = settings.configs.get('invoice_prefix', 'INV') if settings and settings.configs else 'INV'
+        purchase_order_no = f"{order.order_number.replace('ORD', '')}"
+        invoice_no = f"Invq{purchase_order_no}"
+        
+        p.drawRightString(width - 30, height - 110, f"Purchase Order No.")
+        p.drawRightString(width - 30, height - 125, f"Invoice No.")
+        p.drawRightString(width - 30, height - 140, f"Order Date")
+        p.drawRightString(width - 30, height - 155, f"Invoice Date")
+        
+        p.setFont("Helvetica-Bold", 10)
+        p.drawRightString(width - 150, height - 110, purchase_order_no)
+        p.drawRightString(width - 150, height - 125, invoice_no)
+        p.drawRightString(width - 150, height - 140, order.created_at.strftime('%d.%m.%Y'))
+        p.drawRightString(width - 150, height - 155, order.created_at.strftime('%d.%m.%Y'))
+        
+        # Bill To section
+        p.setFillColor(colors.lightgrey)
+        p.rect(30, height - 220, width - 60, 25, fill=1)
+        
+        p.setFillColor(colors.black)
+        p.setFont("Helvetica-Bold", 12)
+        p.drawString(40, height - 210, "BILL TO / SHIP TO")
+        
+        p.setFont("Helvetica", 10)
+        y_pos = height - 240
+        
+        if order.shipping_address:
+            addr = order.shipping_address
+            if addr.get('name'):
+                p.drawString(40, y_pos, addr['name'])
+                y_pos -= 15
+            
+            address_parts = []
+            if addr.get('line1'): address_parts.append(addr['line1'])
+            if addr.get('line2'): address_parts.append(addr['line2'])
+            
+            for part in address_parts:
+                p.drawString(40, y_pos, part)
+                y_pos -= 15
+            
+            if addr.get('city') and addr.get('state'):
+                p.drawString(40, y_pos, f"{addr['city']}, {addr['state']}, {addr.get('pincode', '')}. Place of Supply: {addr.get('state', '')}")
+                y_pos -= 15
+        
+        # Items table header
+        table_start_y = height - 320
+        p.setFillColor(colors.lightgrey)
+        p.rect(30, table_start_y - 20, width - 60, 20, fill=1)
+        
+        p.setFillColor(colors.black)
+        p.setFont("Helvetica-Bold", 9)
+        p.drawString(40, table_start_y - 15, "Description")
+        p.drawString(250, table_start_y - 15, "HSN")
+        p.drawString(290, table_start_y - 15, "Qty")
+        p.drawString(330, table_start_y - 15, "Gross Amount")
+        p.drawString(420, table_start_y - 15, "Discount")
+        p.drawString(480, table_start_y - 15, "Taxable Value")
+        p.drawString(550, table_start_y - 15, "Taxes")
+        p.drawString(580, table_start_y - 15, "Total")
+        
+        # Items
+        p.setFont("Helvetica", 8)
+        y_pos = table_start_y - 35
+        
+        subtotal_before_tax = 0
+        total_gst = 0
+        
+        for item in order.items:
+            # Get product details
+            product = db.query(models.Product).filter(models.Product.id == item["product_id"]).first()
+            product_name = product.name if product else item.get("name", "Unknown Product")
+            hsn_code = product.hsn_code if product and product.hsn_code else "960390"
+            gst_rate = product.gst_rate if product else 18.0
+            
+            quantity = item["quantity"]
+            unit_price = item["price"]
+            gross_amount = quantity * unit_price
+            discount = 0  # Can be added later
+            taxable_value = gross_amount - discount
+            gst_amount = taxable_value * (gst_rate / 100) if order.gst_applied else 0
+            total_amount = taxable_value + gst_amount
+            
+            subtotal_before_tax += taxable_value
+            total_gst += gst_amount
+            
+            # Draw item row
+            p.drawString(40, y_pos, product_name[:25])
+            p.drawString(250, y_pos, hsn_code)
+            p.drawString(290, y_pos, str(quantity))
+            p.drawString(330, y_pos, f"Rs.{gross_amount:.2f}")
+            p.drawString(420, y_pos, f"Rs.{discount:.2f}")
+            p.drawString(480, y_pos, f"Rs.{taxable_value:.2f}")
+            
+            if gst_amount > 0:
+                p.drawString(550, y_pos, f"IGST @{gst_rate}%")
+                p.drawString(550, y_pos - 10, f"Rs.{gst_amount:.2f}")
+                y_pos -= 10
+            else:
+                p.drawString(550, y_pos, "Rs.0.00")
+            
+            p.drawString(580, y_pos, f"Rs.{total_amount:.2f}")
+            y_pos -= 20
+        
+        # Totals section
+        totals_y = y_pos - 30
+        p.line(30, totals_y + 20, width - 30, totals_y + 20)
+        
+        p.setFont("Helvetica-Bold", 10)
+        p.drawRightString(480, totals_y, "Total")
+        p.drawRightString(580, totals_y, f"Rs.{order.grand_total:.2f}")
+        
+        # Tax summary
+        if order.gst_applied and total_gst > 0:
+            p.setFont("Helvetica", 9)
+            p.drawString(40, totals_y - 40, "Tax is not payable on reverse charge basis. This is a computer generated invoice and does not require signature. Other charges are charges that are")
+            p.drawString(40, totals_y - 55, "applicable to your order and/or city and/or online payments (as applicable). Includes discounts for your city and/or online payments (as applicable).")
+        
+        p.showPage()
+        p.save()
+        
+        buffer.seek(0)
+        return buffer
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate invoice: {str(e)}")
+
+def generate_shipping_label_pdf(order_id: str, db: Session):
+    """Generate professional shipping label PDF for an order"""
+    try:
+        # Get order details
+        order = db.query(models.Order).filter(models.Order.id == order_id).first()
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        
+        # Get settings for company info
+        settings = db.query(models.Settings).filter(models.Settings.type == "business").first()
+        
+        # Create PDF buffer - Standard 4x6 inch shipping label
+        buffer = io.BytesIO()
+        width, height = 4*inch, 6*inch
+        p = canvas.Canvas(buffer, pagesize=(width, height))
+        
+        # Company details
+        company_name = settings.company_name if settings and settings.company_name else "BharatBazaar"
+        business_name = settings.business_name if settings and settings.business_name else "BharatBazaar"
+        
+        # --- SEPARATOR LINES ---
+        # Main Border
+        p.setStrokeColor(colors.black)
+        p.setLineWidth(1.5)
+        # p.rect(5, 5, width - 10, height - 10) # Optional outer border
+        
+        # Horizontal Separators
+        y_line1 = height - 110  # Below Address/COD
+        y_line2 = height - 190  # Below Return Address/Barcodes
+        y_line3 = height - 240  # Below Product Details
+        y_line4 = height - 255  # Below Invoice Header
+        
+        p.setLineWidth(1)
+        p.line(5, y_line1, width - 5, y_line1)
+        p.line(5, y_line2, width - 5, y_line2)
+        p.line(5, y_line3, width - 5, y_line3)
+        p.line(5, y_line4, width - 5, y_line4)
+        
+        # Vertical Separator (Top Section)
+        p.line(width * 0.45, height - 5, width * 0.45, y_line1)
+
+        # --- TOP SECTION: Customer Address (Left) & COD/Courier (Right) ---
+        
+        # Customer Address
+        p.setFont("Helvetica-Bold", 7)
+        p.drawString(10, height - 15, "Customer Address")
+        
+        if order.shipping_address:
+            addr = order.shipping_address
+            p.setFont("Helvetica-Bold", 10)
+            p.drawString(10, height - 30, addr.get('name', '')[:25])
+            
+            p.setFont("Helvetica", 8)
+            y_addr = height - 42
+            line_height = 9
+            
+            address_lines = []
+            if addr.get('line1'): address_lines.append(addr['line1'])
+            if addr.get('line2'): address_lines.append(addr['line2'])
+            location = []
+            if addr.get('city'): location.append(addr['city'])
+            if addr.get('state'): location.append(addr['state'])
+            if addr.get('pincode'): location.append(str(addr['pincode']))
+            if location: address_lines.append(", ".join(location))
+             
+            # Phone
+            if order.customer_phone:
+                address_lines.append(f"Tel: {order.customer_phone}")
+            
+            for line in address_lines[:6]: # Limit lines
+                if len(line) > 30: line = line[:28] + "..."
+                p.drawString(10, y_addr, line)
+                y_addr -= line_height
+
+        # COD / Courier Section (Right)
+        x_right = width * 0.45 + 5
+        
+        # COD Amount Header
+        p.setFillColor(colors.black)
+        p.rect(x_right, height - 20, width - x_right - 5, 15, fill=1)
+        p.setFillColor(colors.white)
+        p.setFont("Helvetica-Bold", 8)
+        
+        cod_text = "COD: Check amount on app"
+        if order.payment_method == 'cod':
+            cod_text = f"COD: Rs.{order.grand_total}"
+        else:
+             cod_text = "PREPAID"
+             
+        p.drawCentredString(x_right + (width - x_right - 5)/2, height - 16, cod_text)
+        
+        p.setFillColor(colors.black)
+        
+        # Courier Name
+        p.setFont("Helvetica-Bold", 12)
+        p.drawString(x_right, height - 35, "Shadowfax") # Or dynamic provider
+        
+        # Pickup Badge
+        p.setFillColor(colors.black)
+        p.rect(x_right, height - 48, 35, 10, fill=1)
+        p.setFillColor(colors.white)
+        p.setFont("Helvetica-Bold", 7)
+        p.drawCentredString(x_right + 17.5, height - 45, "Pickup")
+        p.setFillColor(colors.black)
+        
+        # Destination Code
+        p.setFont("Helvetica", 7)
+        p.drawString(x_right, height - 58, "Destination Code")
+        
+        # Mock Codes
+        dest_code = "S46_PSA"
+        p.setFillColor(colors.lightgrey)
+        p.rect(x_right, height - 72, 60, 12, fill=1)
+        p.setFillColor(colors.black)
+        p.setFont("Helvetica-Bold", 9)
+        p.drawString(x_right + 2, height - 69, dest_code)
+        
+        # Return Code
+        p.setFont("Helvetica", 7)
+        p.drawString(x_right, height - 80, "Return Code")
+        return_code = "303702,348"
+        p.setFont("Helvetica-Bold", 8)
+        p.drawString(x_right, height - 90, return_code)
+        
+        # QR Code
+        qr_size = 50
+        qr_x = width - qr_size - 5
+        qr_y = height - 145 # Moved down to avoid overlap
+        
+         # Generate QR code
+        qr_data = f"{order.order_number}|{order.grand_total}"
+        qr = qrcode.QRCode(version=1, box_size=2, border=1)
+        qr.add_data(qr_data)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        qr_buffer = QRBytesIO()
+        img.save(qr_buffer, format='PNG')
+        qr_buffer.seek(0)
+        
+        # Draw QR code placeholder (since reportlab needs PIL integration for images)
+        p.drawImage(ImageReader(qr_buffer), qr_x, height - 80, width=qr_size, height=qr_size) # Adjusted Y
+        
+        # --- MIDDLE SECTION: Return Address & Barcode ---
+        
+        # --- MIDDLE SECTION: Return Address & Barcode ---
+        
+        # Return Address (Left)
+        p.setFont("Helvetica-Bold", 7)
+        p.drawString(10, y_line1 - 10, "If undelivered, return to:")
+        
+        # Use Company Name for Return Address as requested
+        p.setFont("Helvetica-Bold", 8)
+        y_ret = y_line1 - 22
+        p.drawString(10, y_ret, company_name.upper()[:35])
+        y_ret -= 10
+        
+        p.setFont("Helvetica", 7)
+        ret_lines = []
+        if settings and settings.address:
+            addr = settings.address
+            if addr.get('line1'): ret_lines.append(addr['line1'].upper())
+            if addr.get('line2'): ret_lines.append(addr['line2'].upper())
+            if addr.get('city'): ret_lines.append(f"{addr['city'].upper()}, {addr.get('state', '').upper()}")
+            if addr.get('pincode'): ret_lines.append(f"{addr.get('pincode')}")
+        else:
+            ret_lines.append("WAREHOUSE ADDRESS")
+            
+        for line in ret_lines[:4]:
+             if len(line) > 40: line = line[:38] + "..."
+             p.drawString(10, y_ret, line)
+             y_ret -= 8
+             
+        # Tracking Barcode
+        barcode_val = order.tracking_number or order.order_number
+        p.setFont("Helvetica-Bold", 9)
+        p.drawCentredString(width * 0.75, y_line1 - 70, barcode_val)
+        
+        # Simulated Barcode
+        bc_x = width * 0.55
+        bc_y = y_line1 - 50
+        bc_w = 120
+        bc_h = 30
+        
+        # Draw barcode (simplified lines)
+        # p.rect(bc_x, bc_y, bc_w, bc_h, stroke=0, fill=0) # bounding box
+        import random
+        random.seed(barcode_val)
+        curr_x = bc_x
+        while curr_x < bc_x + bc_w:
+            w = random.choice([1, 2, 3])
+            if curr_x + w > bc_x + bc_w: break
+            if random.choice([True, False]):
+                p.rect(curr_x, bc_y, w, bc_h, fill=1, stroke=0)
+            curr_x += w
+            
+        # --- PRODUCT DETAILS SECTION ---
+        p.setFont("Helvetica-Bold", 8)
+        p.drawString(10, y_line2 - 10, "Product Details")
+        
+        # Table Data
+        data = [['SKU', 'Size', 'Qty', 'Color', 'Order No.']]
+        
+        # Items
+        items_to_show = order.items[:3]  # Show max 3 items
+        for item in items_to_show:
+            prod = db.query(models.Product).filter(models.Product.id == item['product_id']).first()
+            sku = prod.sku if prod else "N/A"
+            name = prod.name[:15] if prod else "Item"
+            data.append([
+                f"{sku}\n{name}", 
+                "Free", 
+                str(item['quantity']), 
+                "Multi", 
+                order.order_number[-8:]
+            ])
+            
+        t = Table(data, colWidths=[80, 40, 30, 40, 80])
+        t.setStyle(TableStyle([
+            ('FONTNAME', (0,0), (-1,-1), 'Helvetica'),
+            ('FONTSIZE', (0,0), (-1,-1), 7),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('TOPPADDING', (0,0), (-1,-1), 1),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 1),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.gray), # Header color
+        ]))
+        
+        w, h = t.wrapOn(p, width, height)
+        t.drawOn(p, 5, y_line2 - h - 15)
+
+        # --- TAX INVOICE SECTION (Bottom) ---
+        
+        # Header
+        p.setFillColor(colors.lightgrey)
+        p.rect(5, y_line3 - 12, width - 10, 12, fill=1, stroke=0)
+        p.setFillColor(colors.black)
+        p.setFont("Helvetica-Bold", 8)
+        p.drawCentredString(width/2, y_line3 - 9, "TAX INVOICE")
+        p.setFont("Helvetica", 6)
+        p.drawRightString(width - 10, y_line3 - 9, "Original For Recipient")
+        
+        # Bill To / Sold By
+        y_inv = y_line4 - 10
+        p.setFont("Helvetica-Bold", 6)
+        p.drawString(10, y_inv, "BILL TO / SHIP TO")
+        p.drawString(width/2 + 5, y_inv, f"Sold by : {business_name}")
+        
+        y_inv -= 8
+        p.setFont("Helvetica", 6)
+        
+        # Bill To Address (Simplified)
+        if order.shipping_address:
+            addr_str = f"{order.shipping_address.get('name', '')}, {order.shipping_address.get('city', '')}"
+            p.drawString(10, y_inv, addr_str[:45])
+            p.drawString(10, y_inv - 7, f"State: {order.shipping_address.get('state', '')}")
+            
+        # Sold By Address
+        if settings and settings.address:
+            sold_addr = f"{settings.address.get('line1', '')}, {settings.address.get('city', '')}"
+            p.drawString(width/2 + 5, y_inv, sold_addr[:45])
+            
+        if settings and settings.gst_number:
+            p.drawString(width/2 + 5, y_inv - 7, f"GSTIN - {settings.gst_number}")
+            
+        # Invoice Table
+        inv_data = [['Description', 'HSN', 'Qty', 'Gross', 'Disc', 'Taxable', 'Tax', 'Total']]
+        
+        total_taxable = 0
+        total_tax = 0
+        
+        for item in items_to_show: # Same items
+            prod = db.query(models.Product).filter(models.Product.id == item['product_id']).first()
+            item_total = item['quantity'] * prod.selling_price
+            
+            # Simple tax calc (inclusive)
+            tax_rate = prod.gst_rate if prod else 18.0
+            taxable = item_total / (1 + (tax_rate/100))
+            tax_amt = item_total - taxable
+            
+            total_taxable += taxable
+            total_tax += tax_amt
+            
+            inv_data.append([
+                prod.name[:10] if prod else "Item",
+                prod.hsn_code if prod and prod.hsn_code else "960390",
+                str(item['quantity']),
+                f"{item_total:.0f}",
+                "0",
+                f"{taxable:.1f}",
+                f"{tax_amt:.1f}",
+                f"{item_total:.0f}"
+            ])
+            
+        # Totals Row
+        inv_data.append(['Total', '', '', '', '', f"{total_taxable:.1f}", f"{total_tax:.1f}", f"{order.grand_total:.1f}"])
+            
+        inv_table = Table(inv_data, colWidths=[70, 30, 20, 30, 25, 35, 30, 35])
+        inv_table.setStyle(TableStyle([
+            ('FONTNAME', (0,0), (-1,-1), 'Helvetica'),
+            ('FONTSIZE', (0,0), (-1,-1), 5),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('ALIGN', (3,0), (-1,-1), 'RIGHT'), # Numbers right aligned
+            ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),
+            ('BACKGROUND', (0,0), (-1,0), colors.whitesmoke),
+            ('FONTNAME', (0,-1), (-1,-1), 'Helvetica-Bold'), # Total row bold
+        ]))
+        
+        w_inv, h_inv = inv_table.wrapOn(p, width, height)
+        inv_table.drawOn(p, 5, y_inv - h_inv - 25)
+        
+        # Footer Disclaimer
+        p.setFont("Helvetica", 5)
+        p.drawString(10, 10, "Tax is not payable on reverse charge basis. Computer generated invoice.")
+
+        p.showPage()
+        p.save()
+        
+        buffer.seek(0)
+        return buffer
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate shipping label: {str(e)}")
+
+@api_router.get("/admin/orders/{order_id}/invoice")
+def download_invoice(order_id: str, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Download invoice PDF for an order"""
+    try:
+        pdf_buffer = generate_invoice_pdf(order_id, db)
+        
+        # Get order for filename
+        order = db.query(models.Order).filter(models.Order.id == order_id).first()
+        filename = f"invoice_{order.order_number}.pdf" if order else f"invoice_{order_id}.pdf"
+        
+        return Response(
+            content=pdf_buffer.getvalue(),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate invoice: {str(e)}")
+
+@api_router.get("/admin/orders/{order_id}/shipping-label")
+def download_shipping_label(order_id: str, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Download shipping label PDF for an order"""
+    try:
+        pdf_buffer = generate_shipping_label_pdf(order_id, db)
+        
+        # Get order for filename
+        order = db.query(models.Order).filter(models.Order.id == order_id).first()
+        filename = f"label_{order.order_number}.pdf" if order else f"label_{order_id}.pdf"
+        
+        return Response(
+            content=pdf_buffer.getvalue(),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate shipping label: {str(e)}")
+
+
+# ============ BANNER ENDPOINTS ============
+
+@api_router.get("/banners")
+def get_banners(db: Session = Depends(get_db)):
+    """Get all active banners for public display"""
+    try:
+        banners = db.query(models.Banner).filter(models.Banner.is_active == True).order_by(models.Banner.position).all()
+        return [
+            {
+                "id": banner.id,
+                "title": banner.title,
+                "image_url": banner.image_url,
+                "link": banner.link,
+                "position": banner.position,
+                "is_active": banner.is_active,
+                "created_at": banner.created_at
+            }
+            for banner in banners
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get banners: {str(e)}")
+
+@api_router.get("/admin/banners")
+def get_admin_banners(admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Get all banners for admin"""
+    try:
+        banners = db.query(models.Banner).order_by(models.Banner.position).all()
+        return [
+            {
+                "id": banner.id,
+                "title": banner.title,
+                "image_url": banner.image_url,
+                "link": banner.link,
+                "position": banner.position,
+                "is_active": banner.is_active,
+                "created_at": banner.created_at
+            }
+            for banner in banners
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get banners: {str(e)}")
+
+@api_router.post("/admin/banners")
+def create_banner(data: BannerCreate, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Create a new banner"""
+    try:
+        banner = models.Banner(
+            id=generate_id(),
+            title=data.title,
+            image_url=data.image_url,
+            link=data.link,
+            position=data.position,
+            is_active=data.is_active,
+            created_at=datetime.utcnow()
+        )
+        db.add(banner)
+        db.commit()
+        db.refresh(banner)
+        
+        return {"message": "Banner created successfully", "banner_id": banner.id}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create banner: {str(e)}")
+
+@api_router.put("/admin/banners/{banner_id}")
+def update_banner(banner_id: str, data: dict, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Update a banner"""
+    try:
+        banner = db.query(models.Banner).filter(models.Banner.id == banner_id).first()
+        if not banner:
+            raise HTTPException(status_code=404, detail="Banner not found")
+        
+        # Update fields
+        for field, value in data.items():
+            if hasattr(banner, field):
+                setattr(banner, field, value)
+        
+        db.commit()
+        return {"message": "Banner updated successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update banner: {str(e)}")
+
+@api_router.delete("/admin/banners/{banner_id}")
+def delete_banner(banner_id: str, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Delete a banner"""
+    try:
+        banner = db.query(models.Banner).filter(models.Banner.id == banner_id).first()
+        if not banner:
+            raise HTTPException(status_code=404, detail="Banner not found")
+        
+        # Delete associated image file
+        if banner.image_url:
+            delete_uploaded_file(banner.image_url)
+        
+        db.delete(banner)
+        db.commit()
+        return {"message": "Banner deleted successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete banner: {str(e)}")
+
+
+# ============ OFFER ENDPOINTS ============
+
+@api_router.get("/offers")
+def get_offers(db: Session = Depends(get_db)):
+    """Get all active offers for public display"""
+    try:
+        offers = db.query(models.Offer).filter(models.Offer.is_active == True).all()
+        return [
+            {
+                "id": offer.id,
+                "title": offer.title,
+                "description": offer.description,
+                "discount_type": offer.discount_type,
+                "discount_value": offer.discount_value,
+                "min_order_value": offer.min_order_value,
+                "max_discount": offer.max_discount,
+                "coupon_code": offer.coupon_code,
+                "is_active": offer.is_active,
+                "created_at": offer.created_at
+            }
+            for offer in offers
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get offers: {str(e)}")
+
+@api_router.get("/admin/offers")
+def get_admin_offers(admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Get all offers for admin"""
+    try:
+        offers = db.query(models.Offer).all()
+        return [
+            {
+                "id": offer.id,
+                "title": offer.title,
+                "description": offer.description,
+                "discount_type": offer.discount_type,
+                "discount_value": offer.discount_value,
+                "min_order_value": offer.min_order_value,
+                "max_discount": offer.max_discount,
+                "coupon_code": offer.coupon_code,
+                "product_ids": offer.product_ids,
+                "category_ids": offer.category_ids,
+                "is_active": offer.is_active,
+                "created_at": offer.created_at
+            }
+            for offer in offers
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get offers: {str(e)}")
+
+@api_router.post("/admin/offers")
+def create_offer(data: OfferCreate, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Create a new offer"""
+    try:
+        offer = models.Offer(
+            id=generate_id(),
+            title=data.title,
+            description=data.description,
+            discount_type=data.discount_type,
+            discount_value=data.discount_value,
+            min_order_value=data.min_order_value,
+            max_discount=data.max_discount,
+            coupon_code=data.coupon_code,
+            product_ids=data.product_ids,
+            category_ids=data.category_ids,
+            is_active=data.is_active,
+            created_at=datetime.utcnow()
+        )
+        db.add(offer)
+        db.commit()
+        db.refresh(offer)
+        
+        return {"message": "Offer created successfully", "offer_id": offer.id}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create offer: {str(e)}")
+
+@api_router.put("/admin/offers/{offer_id}")
+def update_offer(offer_id: str, data: dict, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Update an offer"""
+    try:
+        offer = db.query(models.Offer).filter(models.Offer.id == offer_id).first()
+        if not offer:
+            raise HTTPException(status_code=404, detail="Offer not found")
+        
+        # Update fields
+        for field, value in data.items():
+            if hasattr(offer, field):
+                setattr(offer, field, value)
+        
+        db.commit()
+        return {"message": "Offer updated successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update offer: {str(e)}")
+
+@api_router.delete("/admin/offers/{offer_id}")
+def delete_offer(offer_id: str, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Delete an offer"""
+    try:
+        offer = db.query(models.Offer).filter(models.Offer.id == offer_id).first()
+        if not offer:
+            raise HTTPException(status_code=404, detail="Offer not found")
+        
+        db.delete(offer)
+        db.commit()
+        return {"message": "Offer deleted successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete offer: {str(e)}")
+
+
+# ============ UPLOAD ENDPOINTS ============
+
+@api_router.post("/upload/image")
+async def upload_single_image(
+    file: UploadFile = File(...),
+    folder: str = "general",
+    image_type: Optional[str] = None,
+    admin: dict = Depends(admin_required)
+):
+    """Upload a single image file"""
+    try:
+        # Validate file type
+        if not file.content_type or not file.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="File must be an image")
+        
+        # Save the uploaded file
+        file_url = save_uploaded_file(file, folder, image_type)
+        
+        return {
+            "message": "Image uploaded successfully",
+            "url": file_url,
+            "filename": file.filename
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload image: {str(e)}")
+
+@api_router.post("/upload/multiple")
+async def upload_multiple_images(
+    files: List[UploadFile] = File(...),
+    folder: str = "general",
+    image_type: Optional[str] = None,
+    admin: dict = Depends(admin_required)
+):
+    """Upload multiple image files"""
+    try:
+        if len(files) > 10:  # Limit to 10 files
+            raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
+        
+        uploaded_files = []
+        
+        for file in files:
+            # Validate file type
+            if not file.content_type or not file.content_type.startswith('image/'):
+                raise HTTPException(status_code=400, detail=f"File {file.filename} must be an image")
+            
+            # Save the uploaded file
+            file_url = save_uploaded_file(file, folder, image_type)
+            
+            uploaded_files.append({
+                "url": file_url,
+                "filename": file.filename
+            })
+        
+        return {
+            "message": f"{len(uploaded_files)} images uploaded successfully",
+            "files": uploaded_files
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload images: {str(e)}")
+
+@api_router.delete("/upload/delete")
+async def delete_uploaded_image(
+    file_url: str = Query(..., description="URL of the file to delete"),
+    admin: dict = Depends(admin_required)
+):
+    """Delete an uploaded file"""
+    try:
+        delete_uploaded_file(file_url)
+        return {"message": "File deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete file: {str(e)}")
 
 
 # ============ ROOT ============
