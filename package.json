@@ -1,0 +1,19 @@
+{
+  "name": "ecom-website",
+  "version": "1.0.0",
+  "description": "E-commerce website with React frontend and Python backend",
+  "main": "index.js",
+  "scripts": {
+    "build": "cd frontend && npm ci && npm run build",
+    "start": "cd frontend && npm start",
+    "install": "cd frontend && npm install",
+    "postinstall": "cd frontend && npm install"
+  },
+  "keywords": ["ecommerce", "react", "python", "fastapi"],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
+  }
+}
