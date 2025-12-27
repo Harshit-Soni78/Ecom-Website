@@ -13,8 +13,9 @@ import { MultipleImageUpload } from '../../components/ui/image-upload';
 import { productsAPI, categoriesAPI } from '../../lib/api';
 import { getImageUrl } from '../../lib/utils';
 import { toast } from 'sonner';
-import { Plus, Pencil, Trash2, Search, Package, Eye, Upload, Download, FileSpreadsheet } from 'lucide-react';
+import { Plus, Pencil, Trash2, Search, Package, Eye, Upload, Download, FileSpreadsheet, Barcode } from 'lucide-react';
 import { usePopup } from '../../contexts/PopupContext';
+import JsBarcode from 'jsbarcode';
 
 export default function AdminProducts() {
   const [products, setProducts] = useState([]);
@@ -167,6 +168,39 @@ export default function AdminProducts() {
         }
       }
     });
+  };
+
+  const generateBarcode = (product) => {
+    try {
+      // Create a canvas element
+      const canvas = document.createElement('canvas');
+
+      // Generate barcode using SKU
+      JsBarcode(canvas, product.sku, {
+        format: 'CODE128',
+        width: 2,
+        height: 100,
+        displayValue: true,
+        fontSize: 14,
+        margin: 10
+      });
+
+      // Convert canvas to blob and download
+      canvas.toBlob((blob) => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `barcode-${product.sku}.png`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        toast.success(`Barcode generated for ${product.name}`);
+      });
+    } catch (error) {
+      console.error('Barcode generation error:', error);
+      toast.error('Failed to generate barcode');
+    }
   };
 
   const downloadTemplate = () => {
@@ -813,6 +847,14 @@ export default function AdminProducts() {
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-2">
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          onClick={() => generateBarcode(product)}
+                          title="Generate Barcode"
+                        >
+                          <Barcode className="w-4 h-4" />
+                        </Button>
                         <Button size="icon" variant="ghost" onClick={() => handleEdit(product)} data-testid={`edit-product-${product.id}`}>
                           <Pencil className="w-4 h-4" />
                         </Button>

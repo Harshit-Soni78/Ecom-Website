@@ -3,7 +3,8 @@ import { Link, useNavigate } from 'react-router-dom';
 import { Button } from '../components/ui/button';
 import { Card } from '../components/ui/card';
 import { Badge } from '../components/ui/badge';
-import { Carousel, CarouselContent, CarouselItem, CarouselPrevious, CarouselNext } from '../components/ui/carousel';
+import { Carousel, CarouselContent, CarouselItem } from '../components/ui/carousel';
+import Autoplay from "embla-carousel-autoplay";
 import { Star, ChevronRight, Truck, Shield, RefreshCcw, Headphones, Tag, Copy } from 'lucide-react';
 import { productsAPI, categoriesAPI, bannersAPI, offersAPI } from '../lib/api';
 import { useCart } from '../contexts/CartContext';
@@ -110,7 +111,14 @@ export default function HomePage() {
       {/* Hero Banner Carousel */}
       <section className="relative">
         {banners.length > 0 ? (
-          <Carousel className="w-full">
+          <Carousel
+            className="w-full"
+            plugins={[
+              Autoplay({
+                delay: 3000,
+              }),
+            ]}
+          >
             <CarouselContent>
               {banners.map((banner, index) => (
                 <CarouselItem key={banner.id || index}>
@@ -138,8 +146,6 @@ export default function HomePage() {
                 </CarouselItem>
               ))}
             </CarouselContent>
-            <CarouselPrevious className="left-4" />
-            <CarouselNext className="right-4" />
           </Carousel>
         ) : (
           <div className="gradient-hero aspect-[21/9] md:aspect-[3/1] flex items-center">

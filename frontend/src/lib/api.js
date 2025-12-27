@@ -40,6 +40,7 @@ export const authAPI = {
   login: (phone, password) => api.post('/auth/login', { phone, password }),
   getMe: () => api.get('/auth/me'),
   updateProfile: (data) => api.put('/auth/profile', data),
+  changePassword: (data) => api.put('/auth/change-password', data),
 };
 
 // Products API
@@ -164,7 +165,7 @@ export const courierAPI = {
   getLabel: (orderId) => api.get(`/courier/label/${orderId}`),
   getInvoice: (orderId) => api.get(`/courier/invoice/${orderId}`),
   cancelShipment: (orderId) => api.post(`/courier/cancel/${orderId}`),
-  createReturn: (orderId, returnData) => api.post(`/courier/create-return/${orderId}`, returnData),
+  createReturn: (orderId, returnData) => api.post(`/admin/couriers/create-return/${orderId}`, returnData),
   getPicklist: (date) => api.get('/admin/picklist', { params: { date } }),
 };
 
@@ -222,11 +223,11 @@ export const printAPI = {
 
 // Payment QR API
 export const paymentAPI = {
-  getQR: (amount, customerName = 'Customer', orderNumber = '') => 
-    api.post('/generate-qr', { 
-      amount, 
-      customer_name: customerName, 
-      order_number: orderNumber 
+  getQR: (amount, customerName = 'Customer', orderNumber = '') =>
+    api.post('/generate-qr', {
+      amount,
+      customer_name: customerName,
+      order_number: orderNumber
     }),
 };
 

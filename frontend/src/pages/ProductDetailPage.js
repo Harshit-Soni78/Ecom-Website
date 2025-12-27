@@ -221,7 +221,22 @@ export default function ProductDetailPage() {
               size="sm"
               showText={true}
             />
-            <Button variant="ghost" size="sm">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                if (navigator.share) {
+                  navigator.share({
+                    title: product.name,
+                    text: product.description,
+                    url: window.location.href,
+                  }).catch((error) => console.log('Error sharing', error));
+                } else {
+                  navigator.clipboard.writeText(window.location.href);
+                  toast.success('Link copied to clipboard!');
+                }
+              }}
+            >
               <Share2 className="w-4 h-4 mr-2" />
               Share
             </Button>

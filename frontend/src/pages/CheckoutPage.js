@@ -158,14 +158,22 @@ export default function CheckoutPage() {
   };
 
   const handleAddressChange = (field, value) => {
+    // Prevent redundant updates/checks if value hasn't changed
+    if (field === 'pincode' && value === address.pincode) return;
+
     setAddress(prev => ({ ...prev, [field]: value }));
 
     // Auto-verify pincode when user enters 6 digits
-    if (field === 'pincode' && value.length === 6 && /^\d{6}$/.test(value)) {
-      verifyPincode(value);
-    } else if (field === 'pincode' && value.length < 6) {
-      // Reset verification when pincode is incomplete
-      setPincodeVerification({ checking: false, result: null, error: null });
+    if (field === 'pincode') {
+      if (value.length === 6 && /^\d{6}$/.test(value)) {
+        // Only verify if we haven't already verified this exact pincode
+        if (pincodeVerification.result?.pincode !== value) {
+          verifyPincode(value);
+        }
+      } else if (value.length < 6) {
+        // Reset verification when pincode is incomplete
+        setPincodeVerification({ checking: false, result: null, error: null });
+      }
     }
   };
 
@@ -184,6 +192,18 @@ export default function CheckoutPage() {
 
       if (result.serviceable) {
         toast.success(`✅ Delivery available to ${result.city}, ${result.state}`);
+
+        // Auto-fill city and state if empty or if we want to overwrite
+        setAddress(prev => ({
+          ...prev,
+          city: result.city || prev.city,
+          state: result.state || prev.state
+        }));
+
+        // If COD was selected but is not available, switch to disabled state or notify
+        if (paymentMethod === 'cod' && !result.cod) {
+          toast.warning('COD is not available for this location. Please try online payment.');
+        }
       } else {
         toast.error(`❌ Sorry, we don't deliver to pincode ${pincode}`);
       }
@@ -471,20 +491,35 @@ export default function CheckoutPage() {
               </CardHeader>
               <CardContent>
                 <RadioGroup value={paymentMethod} onValueChange={setPaymentMethod} className="grid sm:grid-cols-2 gap-3">
-                  {paymentOptions.map((option) => (
-                    <label
-                      key={option.id}
-                      className={`flex items-center gap-3 p-4 border rounded-xl cursor-pointer transition-all ${paymentMethod === option.id ? 'border-primary bg-primary/5' : 'hover:border-muted-foreground/50'
-                        }`}
-                    >
-                      <RadioGroupItem value={option.id} id={option.id} />
-                      <option.icon className="w-5 h-5 text-muted-foreground" />
-                      <div>
-                        <p className="font-medium text-sm">{option.name}</p>
-                        <p className="text-xs text-muted-foreground">{option.description}</p>
-                      </div>
-                    </label>
-                  ))}
+                  {paymentOptions.map((option) => {
+                    const isCodDisabled = option.id === 'cod' && pincodeVerification.result && !pincodeVerification.result.cod;
+
+                    return (
+                      <label
+                        key={option.id}
+                        className={`flex items-center gap-3 p-4 border rounded-xl cursor-pointer transition-all 
+                          ${paymentMethod === option.id ? 'border-primary bg-primary/5' : 'hover:border-muted-foreground/50'}
+                          ${isCodDisabled ? 'opacity-50 cursor-not-allowed bg-muted' : ''}
+                        `}
+                      >
+                        <RadioGroupItem
+                          value={option.id}
+                          id={option.id}
+                          disabled={isCodDisabled}
+                        />
+                        <option.icon className="w-5 h-5 text-muted-foreground" />
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <p className="font-medium text-sm">{option.name}</p>
+                            {isCodDisabled && (
+                              <span className="text-[10px] px-1.5 py-0.5 bg-red-100 text-red-600 rounded">Not Available</span>
+                            )}
+                          </div>
+                          <p className="text-xs text-muted-foreground">{option.description}</p>
+                        </div>
+                      </label>
+                    );
+                  })}
                 </RadioGroup>
                 {paymentMethod !== 'cod' && (
                   <p className="text-sm text-amber-600 mt-4 p-3 bg-amber-50 rounded-lg">

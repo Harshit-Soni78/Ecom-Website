@@ -264,3 +264,74 @@ If you didn't request this code, please ignore this email.
     """
     
     return send_email(to_email, subject, html_body, text_body)
+
+
+def send_order_cancelled_email(to_email: str, order_number: str, reason: str, refund_amount: float) -> bool:
+    """
+    Send order cancellation email.
+    
+    Args:
+        to_email: Recipient email address
+        order_number: Order number
+        reason: Cancellation reason
+        refund_amount: Refund amount
+    
+    Returns:
+        bool: True if email was sent successfully
+    """
+    subject = f"Amorlias Mart - Order #{order_number} Cancelled"
+    
+    html_body = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+            .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+            .header {{ background-color: #f44336; color: white; padding: 20px; text-align: center; }}
+            .content {{ background-color: #f9f9f9; padding: 30px; border-radius: 5px; margin-top: 20px; }}
+            .details {{ background-color: #fff; border-left: 4px solid #f44336; padding: 15px; margin: 20px 0; }}
+            .footer {{ text-align: center; margin-top: 30px; font-size: 12px; color: #666; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>Order Cancelled</h1>
+            </div>
+            <div class="content">
+                <h2>Order #{order_number}</h2>
+                <p>Your order #{order_number} has been cancelled.</p>
+                
+                <div class="details">
+                    <p><strong>Reason:</strong> {reason}</p>
+                    <p><strong>Refund Amount:</strong> ₹{refund_amount}</p>
+                    <p><strong>Refund Timeline:</strong> 3-5 business days to your original payment method.</p>
+                </div>
+                
+                <p>If you have any questions, please contact our support team at support@amolias.com</p>
+            </div>
+            <div class="footer">
+                <p>&copy; 2024 Amorlias Mart. All rights reserved.</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    text_body = f"""
+Amorlias Mart - Order #{order_number} Cancelled
+
+Your order #{order_number} has been cancelled.
+
+Reason: {reason}
+Refund Amount: ₹{refund_amount}
+Refund Timeline: 3-5 business days to your original payment method.
+
+If you have any questions, please contact our support team at support@amolias.com
+
+---
+© 2024 Amorlias Mart. All rights reserved.
+    """
+    
+    return send_email(to_email, subject, html_body, text_body)
