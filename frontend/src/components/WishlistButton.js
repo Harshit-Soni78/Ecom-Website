@@ -5,23 +5,24 @@ import { useWishlist } from '../contexts/WishlistContext';
 import { useAuth } from '../contexts/AuthContext';
 import WishlistCategoryDialog from './WishlistCategoryDialog';
 
-export default function WishlistButton({ 
-  product, 
-  className = "", 
+export default function WishlistButton({
+  product,
+  className = "",
   size = "sm",
   variant = "ghost",
   showText = false,
-  children 
+  children
 }) {
   const { isInWishlist, removeFromWishlist, addToWishlist, wishlistCategories } = useWishlist();
   const { user } = useAuth();
   const [showDialog, setShowDialog] = useState(false);
-  
+
   const isInWish = isInWishlist(product.id);
 
   const handleClick = (e) => {
     e.stopPropagation();
-    
+    e.preventDefault();
+
     if (isInWish) {
       removeFromWishlist(product.id);
     } else {

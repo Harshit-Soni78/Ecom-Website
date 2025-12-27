@@ -84,7 +84,9 @@ const NotificationCard = ({ notification, onMarkAsRead, onDelete }) => {
   };
 
   const formatTime = (timestamp) => {
-    const date = new Date(timestamp);
+    // Backend sends UTC timestamps without 'Z', so we need to append it
+    const utcTimestamp = timestamp.endsWith('Z') ? timestamp : timestamp + 'Z';
+    const date = new Date(utcTimestamp);
     return date.toLocaleString();
   };
 

@@ -215,13 +215,28 @@ export default function ProductDetailPage() {
           </div>
 
           <div className="flex gap-4 mt-4">
-            <WishlistButton 
+            <WishlistButton
               product={product}
               variant="ghost"
               size="sm"
               showText={true}
             />
-            <Button variant="ghost" size="sm">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                if (navigator.share) {
+                  navigator.share({
+                    title: product.name,
+                    text: product.description,
+                    url: window.location.href,
+                  }).catch((error) => console.log('Error sharing', error));
+                } else {
+                  navigator.clipboard.writeText(window.location.href);
+                  toast.success('Link copied to clipboard!');
+                }
+              }}
+            >
               <Share2 className="w-4 h-4 mr-2" />
               Share
             </Button>
@@ -286,6 +301,24 @@ export default function ProductDetailPage() {
                 <div className="flex justify-between py-2 border-b">
                   <dt className="text-muted-foreground">Weight</dt>
                   <dd>{product.weight} kg</dd>
+                </div>
+              )}
+              {product.color && (
+                <div className="flex justify-between py-2 border-b">
+                  <dt className="text-muted-foreground">Color</dt>
+                  <dd>{product.color}</dd>
+                </div>
+              )}
+              {product.material && (
+                <div className="flex justify-between py-2 border-b">
+                  <dt className="text-muted-foreground">Material</dt>
+                  <dd>{product.material}</dd>
+                </div>
+              )}
+              {product.origin && (
+                <div className="flex justify-between py-2 border-b">
+                  <dt className="text-muted-foreground">Country of Origin</dt>
+                  <dd>{product.origin}</dd>
                 </div>
               )}
             </dl>

@@ -1,7 +1,29 @@
 {
-  "name": "frontend",
-  "version": "0.1.0",
-  "private": true,
+  "name": "ecom-website",
+  "version": "1.0.0",
+  "description": "E-commerce website with React frontend and Python backend",
+  "main": "index.js",
+  "scripts": {
+    "build": "cd frontend && npm ci && npm run build",
+    "start": "cd frontend && npm start",
+    "dev": "cd frontend && npm run start:frontend",
+    "install-frontend": "cd frontend && npm install",
+    "install-all": "npm run install-frontend",
+    "postinstall": "npm run install-frontend",
+    "test": "cd frontend && npm test",
+    "clean": "cd frontend && rm -rf node_modules build && npm install",
+    "setup": "npm run install-all"
+  },
+  "keywords": ["ecommerce", "react", "python", "fastapi"],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
+  },
+  "workspaces": [
+    "frontend"
+  ],
   "dependencies": {
     "@hookform/resolvers": "^5.0.1",
     "@radix-ui/react-accordion": "^1.2.8",
@@ -60,25 +82,6 @@
     "tailwindcss-animate": "^1.0.7",
     "vaul": "^1.1.2",
     "zod": "^3.24.4"
-  },
-  "scripts": {
-    "start": "concurrently \"npm run start:frontend\" \"npm run start:backend\"",
-    "start:frontend": "craco start",
-    "start:backend": "bash ../start_backend.sh",
-    "build": "craco build",
-    "test": "craco test"
-  },
-  "browserslist": {
-    "production": [
-      ">0.2%",
-      "not dead",
-      "not op_mini all"
-    ],
-    "development": [
-      "last 1 chrome version",
-      "last 1 firefox version",
-      "last 1 safari version"
-    ]
   },
   "devDependencies": {
     "@babel/plugin-proposal-private-property-in-object": "^7.21.11",

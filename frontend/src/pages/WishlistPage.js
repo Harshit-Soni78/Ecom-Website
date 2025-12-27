@@ -161,6 +161,7 @@ export default function WishlistPage() {
     updateCategory,
     deleteCategory,
     updateWishlistItem,
+    getCategoryCount,
     loading
   } = useWishlist();
   const { addToCart } = useCart();
@@ -250,17 +251,17 @@ export default function WishlistPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 flex items-center justify-center">
+      <div className="min-h-screen bg-background flex items-center justify-center">
         <div className="text-center">
           <Loader2 className="w-8 h-8 animate-spin text-primary mx-auto mb-4" />
-          <p className="text-slate-400">Loading your wishlist...</p>
+          <p className="text-muted-foreground">Loading your wishlist...</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
+    <div className="min-h-screen bg-background text-foreground">
       <div className="container mx-auto px-4 py-8">
         {/* Header */}
         <div className="flex items-center justify-between mb-8">
@@ -269,14 +270,14 @@ export default function WishlistPage() {
               variant="ghost"
               size="sm"
               onClick={() => navigate(-1)}
-              className="text-slate-400 hover:text-white"
+              className="text-muted-foreground hover:text-foreground"
             >
               <ArrowLeft className="w-4 h-4 mr-2" />
               Back
             </Button>
             <div>
-              <h1 className="text-3xl font-bold text-white">My Wishlist</h1>
-              <p className="text-slate-400">
+              <h1 className="text-3xl font-bold">My Wishlist</h1>
+              <p className="text-muted-foreground">
                 {wishlistItems.length} {wishlistItems.length === 1 ? 'item' : 'items'} saved
                 {wishlistCategories.length > 0 && ` in ${wishlistCategories.length} ${wishlistCategories.length === 1 ? 'category' : 'categories'}`}
               </p>
@@ -286,7 +287,7 @@ export default function WishlistPage() {
           <div className="flex items-center gap-2">
             <Dialog open={categoryDialogOpen} onOpenChange={setCategoryDialogOpen}>
               <DialogTrigger asChild>
-                <Button variant="outline" className="text-slate-300 border-slate-600 hover:bg-slate-700">
+                <Button variant="outline">
                   <FolderPlus className="w-4 h-4 mr-2" />
                   New Category
                 </Button>
@@ -301,7 +302,7 @@ export default function WishlistPage() {
               <Button
                 variant="outline"
                 onClick={handleClearWishlist}
-                className="text-red-400 border-red-400 hover:bg-red-400 hover:text-white"
+                className="text-destructive border-destructive hover:bg-destructive hover:text-destructive-foreground"
               >
                 <Trash2 className="w-4 h-4 mr-2" />
                 Clear All
@@ -312,15 +313,15 @@ export default function WishlistPage() {
 
         {/* Category Tabs */}
         <Tabs value={selectedCategory} onValueChange={setSelectedCategory} className="mb-6">
-          <TabsList className="bg-slate-800 border-slate-700">
-            <TabsTrigger value="all" className="data-[state=active]:bg-primary">
+          <TabsList className="bg-muted">
+            <TabsTrigger value="all" className="data-[state=active]:bg-background data-[state=active]:text-foreground">
               All Items ({wishlistItems.length})
             </TabsTrigger>
             {wishlistCategories.map(category => (
               <TabsTrigger
                 key={category.id}
                 value={category.id}
-                className="data-[state=active]:bg-primary relative group"
+                className="data-[state=active]:bg-background data-[state=active]:text-foreground relative group"
               >
                 <span style={{ color: category.color }} className="mr-2">
                   {category.icon === 'heart' ? '❤️' :
@@ -334,14 +335,14 @@ export default function WishlistPage() {
                                   category.icon === 'music' ? '🎵' :
                                     category.icon === 'travel' ? '✈️' : '❤️'}
                 </span>
-                {category.name} ({category.item_count || 0})
+                {category.name} ({getCategoryCount(category.id)})
 
                 {!category.is_default && (
                   <div className="absolute -top-2 -right-2 opacity-0 group-hover:opacity-100 transition-opacity">
                     <Button
                       size="sm"
                       variant="ghost"
-                      className="h-6 w-6 p-0 text-slate-400 hover:text-red-400"
+                      className="h-6 w-6 p-0 text-muted-foreground hover:text-destructive"
                       onClick={(e) => {
                         e.stopPropagation();
                         setEditingCategory(category);
@@ -377,9 +378,9 @@ export default function WishlistPage() {
                                             category.icon === 'travel' ? '✈️' : '❤️'}
                         </span>
                         <div>
-                          <h2 className="text-xl font-semibold text-white">{category.name}</h2>
+                          <h2 className="text-xl font-semibold">{category.name}</h2>
                           {category.description && (
-                            <p className="text-slate-400 text-sm">{category.description}</p>
+                            <p className="text-muted-foreground text-sm">{category.description}</p>
                           )}
                         </div>
                       </>
@@ -396,7 +397,6 @@ export default function WishlistPage() {
                           size="sm"
                           variant="outline"
                           onClick={() => setEditingCategory(category)}
-                          className="text-slate-300 border-slate-600 hover:bg-slate-700"
                         >
                           <Edit className="w-4 h-4 mr-2" />
                           Edit
@@ -405,7 +405,7 @@ export default function WishlistPage() {
                           size="sm"
                           variant="outline"
                           onClick={() => handleClearCategory(selectedCategory)}
-                          className="text-orange-400 border-orange-400 hover:bg-orange-400 hover:text-white"
+                          className="text-orange-500 border-orange-500 hover:bg-orange-500 hover:text-white"
                         >
                           <Trash2 className="w-4 h-4 mr-2" />
                           Clear Category
@@ -414,7 +414,7 @@ export default function WishlistPage() {
                           size="sm"
                           variant="outline"
                           onClick={() => handleDeleteCategory(selectedCategory)}
-                          className="text-red-400 border-red-400 hover:bg-red-400 hover:text-white"
+                          className="text-destructive border-destructive hover:bg-destructive hover:text-destructive-foreground"
                         >
                           <Trash2 className="w-4 h-4 mr-2" />
                           Delete Category
@@ -429,16 +429,16 @@ export default function WishlistPage() {
             {/* Wishlist Items */}
             {filteredItems.length === 0 ? (
               <div className="text-center py-16">
-                <Heart className="w-24 h-24 mx-auto text-slate-600 mb-6" />
-                <h2 className="text-2xl font-semibold text-white mb-4">
+                <Heart className="w-24 h-24 mx-auto text-muted-foreground mb-6" />
+                <h2 className="text-2xl font-semibold mb-4">
                   {selectedCategory === 'all' ? 'Your wishlist is empty' : 'No items in this category'}
                 </h2>
-                <p className="text-slate-400 mb-8">
+                <p className="text-muted-foreground mb-8">
                   Save items you love by clicking the heart icon on any product
                 </p>
                 <Button
                   onClick={() => navigate('/products')}
-                  className="bg-primary hover:bg-primary/90"
+                  className="btn-primary"
                 >
                   Start Shopping
                 </Button>
@@ -446,7 +446,7 @@ export default function WishlistPage() {
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
                 {filteredItems.map((product) => (
-                  <Card key={product.id} className="bg-slate-800 border-slate-700 overflow-hidden group hover:shadow-xl transition-all duration-300">
+                  <Card key={product.id} className="overflow-hidden group hover:shadow-xl transition-all duration-300">
                     <div className="relative">
                       <div className="aspect-square overflow-hidden">
                         <img
@@ -477,7 +477,7 @@ export default function WishlistPage() {
                         size="sm"
                         variant="ghost"
                         onClick={() => handleRemoveFromWishlist(product.id)}
-                        className="absolute bottom-3 right-3 text-red-400 hover:text-red-300 hover:bg-red-900/20 opacity-0 group-hover:opacity-100 transition-opacity"
+                        className="absolute bottom-3 right-3 text-red-500 hover:text-red-600 bg-white/80 hover:bg-white opacity-0 group-hover:opacity-100 transition-opacity"
                       >
                         <Heart className="w-4 h-4 fill-current" />
                       </Button>
@@ -485,7 +485,7 @@ export default function WishlistPage() {
 
                     <CardContent className="p-4">
                       <h3
-                        className="font-semibold text-white mb-2 line-clamp-2 cursor-pointer hover:text-primary"
+                        className="font-semibold mb-2 line-clamp-2 cursor-pointer hover:text-primary"
                         onClick={() => navigate(`/products/${product.id}`)}
                       >
                         {product.name}
@@ -496,7 +496,7 @@ export default function WishlistPage() {
                           ₹{product.selling_price?.toLocaleString()}
                         </span>
                         {product.mrp && product.mrp > product.selling_price && (
-                          <span className="text-sm text-slate-400 line-through">
+                          <span className="text-sm text-muted-foreground line-through">
                             ₹{product.mrp.toLocaleString()}
                           </span>
                         )}
@@ -505,7 +505,7 @@ export default function WishlistPage() {
                       {/* Notes */}
                       {product.notes && (
                         <div className="mb-3">
-                          <p className="text-xs text-slate-400 bg-slate-700/50 p-2 rounded">
+                          <p className="text-xs text-muted-foreground bg-muted p-2 rounded">
                             <StickyNote className="w-3 h-3 inline mr-1" />
                             {product.notes}
                           </p>
@@ -515,11 +515,11 @@ export default function WishlistPage() {
                       {/* Stock Status */}
                       <div className="mb-3">
                         {product.stock_qty > 0 ? (
-                          <Badge variant="outline" className="text-green-400 border-green-400">
+                          <Badge variant="outline" className="text-green-600 border-green-600">
                             In Stock
                           </Badge>
                         ) : (
-                          <Badge variant="outline" className="text-red-400 border-red-400">
+                          <Badge variant="outline" className="text-red-600 border-red-600">
                             Out of Stock
                           </Badge>
                         )}
@@ -531,7 +531,7 @@ export default function WishlistPage() {
                           size="sm"
                           onClick={() => handleAddToCart(product)}
                           disabled={product.stock_qty <= 0}
-                          className="flex-1 bg-primary hover:bg-primary/90"
+                          className="flex-1 btn-primary"
                         >
                           <ShoppingCart className="w-4 h-4 mr-2" />
                           Add to Cart
@@ -540,7 +540,6 @@ export default function WishlistPage() {
                           size="sm"
                           variant="outline"
                           onClick={() => navigate(`/products/${product.id}`)}
-                          className="border-slate-600 hover:bg-slate-700"
                         >
                           View
                         </Button>

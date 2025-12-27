@@ -68,8 +68,14 @@ export default function AdminTeam() {
 
     const handleUpdateRole = async (userId, newRole) => {
         try {
-            await api.put(`/admin/team/${userId}`, { role: newRole });
-            toast.success('User role updated successfully');
+            await api.put(`/admin/users/${userId}/role`, { role: newRole });
+
+            if (newRole === 'admin') {
+                toast.success('User promoted to Admin! They will receive a celebration notification. 🎉');
+            } else {
+                toast.success('User role updated successfully');
+            }
+
             fetchUsers();
             setShowEditModal(false);
         } catch (error) {

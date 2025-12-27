@@ -139,7 +139,11 @@ export default function WishlistCategoryDialog({
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
-      <DialogContent className="sm:max-w-md max-h-[90vh] overflow-y-auto">
+      <DialogContent
+        className="sm:max-w-md max-h-[90vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => e.stopPropagation()}
+      >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Heart className="w-5 h-5 text-red-500" />
@@ -177,8 +181,8 @@ export default function WishlistCategoryDialog({
                     <Card
                       key={category.id}
                       className={`cursor-pointer transition-all ${selectedCategory === category.id
-                          ? 'ring-2 ring-blue-500 bg-blue-50'
-                          : 'hover:bg-gray-50'
+                        ? 'ring-2 ring-blue-500 bg-blue-50'
+                        : 'hover:bg-gray-50'
                         }`}
                       onClick={() => setSelectedCategory(category.id)}
                     >

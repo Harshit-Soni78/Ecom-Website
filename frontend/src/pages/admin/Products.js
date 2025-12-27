@@ -13,8 +13,9 @@ import { MultipleImageUpload } from '../../components/ui/image-upload';
 import { productsAPI, categoriesAPI } from '../../lib/api';
 import { getImageUrl } from '../../lib/utils';
 import { toast } from 'sonner';
-import { Plus, Pencil, Trash2, Search, Package, Eye, Upload, Download, FileSpreadsheet } from 'lucide-react';
+import { Plus, Pencil, Trash2, Search, Package, Eye, Upload, Download, FileSpreadsheet, Barcode } from 'lucide-react';
 import { usePopup } from '../../contexts/PopupContext';
+import JsBarcode from 'jsbarcode';
 
 export default function AdminProducts() {
   const [products, setProducts] = useState([]);
@@ -52,14 +53,21 @@ export default function AdminProducts() {
 
   const fetchData = async () => {
     try {
-      const [productsRes, categoriesRes] = await Promise.all([
-        productsAPI.getAll({ limit: 100 }),
-        categoriesAPI.getAll(),
-      ]);
+      // Fetch categories first independently
+      try {
+        const categoriesRes = await categoriesAPI.getAll();
+        console.log('Categories fetched:', categoriesRes.data);
+        setCategories(categoriesRes.data || []);
+      } catch (catError) {
+        console.error('Failed to fetch categories:', catError);
+        toast.error('Failed to load categories');
+      }
+
+      // Then fetch products
+      const productsRes = await productsAPI.getAll({ limit: 100 });
       setProducts(productsRes.data.products || []);
-      setCategories(categoriesRes.data || []);
     } catch (error) {
-      console.error('Failed to fetch data:', error);
+      console.error('Failed to fetch products:', error);
     } finally {
       setLoading(false);
     }
@@ -80,6 +88,9 @@ export default function AdminProducts() {
       low_stock_threshold: '10',
       gst_rate: '18',
       hsn_code: '',
+      color: '',
+      material: '',
+      origin: '',
       images: [],
       is_active: true,
     });
@@ -102,6 +113,9 @@ export default function AdminProducts() {
       low_stock_threshold: String(product.low_stock_threshold || 10),
       gst_rate: String(product.gst_rate || 18),
       hsn_code: product.hsn_code || '',
+      color: product.color || '',
+      material: product.material || '',
+      origin: product.origin || '',
       images: product.images || [],
       is_active: product.is_active,
     });
@@ -156,11 +170,45 @@ export default function AdminProducts() {
     });
   };
 
+  const generateBarcode = (product) => {
+    try {
+      // Create a canvas element
+      const canvas = document.createElement('canvas');
+
+      // Generate barcode using SKU
+      JsBarcode(canvas, product.sku, {
+        format: 'CODE128',
+        width: 2,
+        height: 100,
+        displayValue: true,
+        fontSize: 14,
+        margin: 10
+      });
+
+      // Convert canvas to blob and download
+      canvas.toBlob((blob) => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `barcode-${product.sku}.png`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        toast.success(`Barcode generated for ${product.name}`);
+      });
+    } catch (error) {
+      console.error('Barcode generation error:', error);
+      toast.error('Failed to generate barcode');
+    }
+  };
+
   const downloadTemplate = () => {
     // Create a more comprehensive template with examples
     const csvHeaders = [
       'name', 'sku', 'description', 'category_id', 'mrp', 'selling_price', 'cost_price',
-      'wholesale_price', 'wholesale_min_qty', 'stock_qty', 'low_stock_threshold', 'gst_rate', 'hsn_code', 'is_active'
+      'wholesale_price', 'wholesale_min_qty', 'stock_qty', 'low_stock_threshold', 'gst_rate',
+      'hsn_code', 'color', 'material', 'origin', 'is_active'
     ];
 
     const sampleData = [
@@ -178,6 +226,9 @@ export default function AdminProducts() {
         '10',
         '12',
         'HSN6109',
+        'Blue',
+        'Cotton',
+        'India',
         'true'
       ],
       [
@@ -194,6 +245,9 @@ export default function AdminProducts() {
         '5',
         '12',
         'HSN6203',
+        'Black',
+        'Denim',
+        'USA',
         'true'
       ]
     ];
@@ -280,6 +334,8 @@ export default function AdminProducts() {
             product[header] = value && value !== '' ? parseFloat(value) : null;
           } else if (['wholesale_min_qty', 'stock_qty', 'low_stock_threshold'].includes(header)) {
             product[header] = value && value !== '' ? parseInt(value) : (header === 'wholesale_min_qty' ? 10 : header === 'low_stock_threshold' ? 10 : 0);
+          } else if (['color', 'material', 'origin'].includes(header)) {
+            product[header] = value || null;
           } else if (header === 'is_active') {
             product[header] = value.toLowerCase() === 'true' || value === '1';
           } else {
@@ -447,7 +503,7 @@ export default function AdminProducts() {
                   </div>
                   <div>
                     <p className="font-medium text-slate-400 mb-1">Optional Fields:</p>
-                    <p>description, category_id, wholesale_price, wholesale_min_qty, stock_qty, low_stock_threshold, gst_rate, hsn_code, is_active</p>
+                    <p>description, category_id, wholesale_price, wholesale_min_qty, stock_qty, low_stock_threshold, gst_rate, hsn_code, color, material, origin, is_active</p>
                   </div>
                   <div>
                     <p className="font-medium text-slate-400 mb-1">Tips:</p>
@@ -520,7 +576,7 @@ export default function AdminProducts() {
                       <SelectTrigger className="input-admin">
                         <SelectValue placeholder="Select category" />
                       </SelectTrigger>
-                      <SelectContent>
+                      <SelectContent className="z-[9999] bg-slate-800 border-slate-700">
                         {categories.map((cat) => (
                           <SelectItem key={cat.id} value={cat.id}>{cat.name}</SelectItem>
                         ))}
@@ -544,6 +600,36 @@ export default function AdminProducts() {
                         <SelectItem value="28">28%</SelectItem>
                       </SelectContent>
                     </Select>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-4">
+                  <div className="space-y-2">
+                    <Label>Color</Label>
+                    <Input
+                      value={formData.color}
+                      onChange={(e) => setFormData({ ...formData, color: e.target.value })}
+                      placeholder="e.g. Red"
+                      className="input-admin"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Material</Label>
+                    <Input
+                      value={formData.material}
+                      onChange={(e) => setFormData({ ...formData, material: e.target.value })}
+                      placeholder="e.g. Cotton"
+                      className="input-admin"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Origin</Label>
+                    <Input
+                      value={formData.origin}
+                      onChange={(e) => setFormData({ ...formData, origin: e.target.value })}
+                      placeholder="e.g. India"
+                      className="input-admin"
+                    />
                   </div>
                 </div>
 
@@ -761,6 +847,14 @@ export default function AdminProducts() {
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-2">
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          onClick={() => generateBarcode(product)}
+                          title="Generate Barcode"
+                        >
+                          <Barcode className="w-4 h-4" />
+                        </Button>
                         <Button size="icon" variant="ghost" onClick={() => handleEdit(product)} data-testid={`edit-product-${product.id}`}>
                           <Pencil className="w-4 h-4" />
                         </Button>

@@ -35,6 +35,9 @@ export default function OrderDetailPage() {
   const [evidenceFiles, setEvidenceFiles] = useState([]);
   const [cancellationEligibility, setCancellationEligibility] = useState(null);
   const [returnEligibility, setReturnEligibility] = useState(null);
+  const [showTrackingDialog, setShowTrackingDialog] = useState(false);
+  const [trackingData, setTrackingData] = useState(null);
+  const [loadingTracking, setLoadingTracking] = useState(false);
 
   useEffect(() => {
     fetchOrder();
@@ -82,7 +85,7 @@ export default function OrderDetailPage() {
         reason: cancelReason,
         cancellation_type: 'customer'
       });
-      
+
       toast.success(response.data.message);
       setShowCancelDialog(false);
       fetchOrder(); // Refresh order data
@@ -108,14 +111,14 @@ export default function OrderDetailPage() {
       };
 
       const response = await ordersAPI.createReturn(id, returnPayload);
-      
+
       // Upload evidence files if any
       if (evidenceFiles.length > 0) {
         const formData = new FormData();
         evidenceFiles.forEach(file => {
           formData.append('files', file);
         });
-        
+
         try {
           await returnsAPI.uploadEvidence(response.data.return_id, formData);
           toast.success('Return request submitted with evidence');
@@ -125,7 +128,7 @@ export default function OrderDetailPage() {
       } else {
         toast.success(response.data.message);
       }
-      
+
       setShowReturnDialog(false);
       setReturnData({ returnType: '', reason: '', refundMethod: 'original' });
       setEvidenceFiles([]);
@@ -157,6 +160,24 @@ export default function OrderDetailPage() {
       link.remove();
     } catch (error) {
       toast.error('Failed to download invoice');
+    }
+  };
+
+  const fetchTracking = async () => {
+    if (!order.tracking_number) {
+      toast.error('No tracking number available');
+      return;
+    }
+
+    setLoadingTracking(true);
+    try {
+      const response = await ordersAPI.getTracking(id);
+      setTrackingData(response.data);
+      setShowTrackingDialog(true);
+    } catch (error) {
+      toast.error('Failed to fetch tracking information');
+    } finally {
+      setLoadingTracking(false);
     }
   };
 
@@ -360,12 +381,25 @@ export default function OrderDetailPage() {
               <FileText className="w-4 h-4 mr-2" />
               Download Invoice
             </Button>
-            
+
+            {/* Track Order Button */}
+            {order.tracking_number && (
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={fetchTracking}
+                disabled={loadingTracking}
+              >
+                <Truck className="w-4 h-4 mr-2" />
+                {loadingTracking ? 'Loading...' : 'Track Order'}
+              </Button>
+            )}
+
             {/* Cancellation Button */}
             {order.status !== 'delivered' && order.status !== 'cancelled' && order.status !== 'returned' && (
-              <Button 
-                variant="outline" 
-                className="w-full text-red-600 hover:text-red-700 hover:bg-red-50" 
+              <Button
+                variant="outline"
+                className="w-full text-red-600 hover:text-red-700 hover:bg-red-50"
                 onClick={() => {
                   checkCancellationEligibility();
                   setShowCancelDialog(true);
@@ -375,11 +409,11 @@ export default function OrderDetailPage() {
                 Cancel Order
               </Button>
             )}
-            
+
             {/* Return Button */}
             {order.status === 'delivered' && (
-              <Button 
-                variant="outline" 
+              <Button
+                variant="outline"
                 className="w-full text-orange-600 hover:text-orange-700 hover:bg-orange-50"
                 onClick={() => {
                   checkReturnEligibility();
@@ -411,7 +445,7 @@ export default function OrderDetailPage() {
                 </p>
               </div>
             )}
-            
+
             <div className="space-y-2">
               <Label htmlFor="cancelReason">Reason for Cancellation</Label>
               <Select value={cancelReason} onValueChange={setCancelReason}>
@@ -427,13 +461,13 @@ export default function OrderDetailPage() {
                 </SelectContent>
               </Select>
             </div>
-            
+
             <div className="flex justify-end gap-2">
               <Button variant="outline" onClick={() => setShowCancelDialog(false)}>
                 Keep Order
               </Button>
-              <Button 
-                variant="destructive" 
+              <Button
+                variant="destructive"
                 onClick={handleCancelOrder}
                 disabled={!cancelReason}
               >
@@ -461,12 +495,12 @@ export default function OrderDetailPage() {
                 </p>
               </div>
             )}
-            
+
             <div className="space-y-2">
               <Label htmlFor="returnType">Return Type</Label>
-              <Select 
-                value={returnData.returnType} 
-                onValueChange={(value) => setReturnData({...returnData, returnType: value})}
+              <Select
+                value={returnData.returnType}
+                onValueChange={(value) => setReturnData({ ...returnData, returnType: value })}
               >
                 <SelectTrigger>
                   <SelectValue placeholder="Select return type" />
@@ -479,23 +513,23 @@ export default function OrderDetailPage() {
                 </SelectContent>
               </Select>
             </div>
-            
+
             <div className="space-y-2">
               <Label htmlFor="returnReason">Detailed Reason</Label>
               <Textarea
                 id="returnReason"
                 placeholder="Please describe the issue in detail..."
                 value={returnData.reason}
-                onChange={(e) => setReturnData({...returnData, reason: e.target.value})}
+                onChange={(e) => setReturnData({ ...returnData, reason: e.target.value })}
                 rows={3}
               />
             </div>
-            
+
             <div className="space-y-2">
               <Label htmlFor="refundMethod">Refund Method</Label>
-              <Select 
-                value={returnData.refundMethod} 
-                onValueChange={(value) => setReturnData({...returnData, refundMethod: value})}
+              <Select
+                value={returnData.refundMethod}
+                onValueChange={(value) => setReturnData({ ...returnData, refundMethod: value })}
               >
                 <SelectTrigger>
                   <SelectValue />
@@ -507,7 +541,7 @@ export default function OrderDetailPage() {
                 </SelectContent>
               </Select>
             </div>
-            
+
             <div className="space-y-2">
               <Label htmlFor="evidence">Upload Evidence (Optional)</Label>
               <div className="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center">
@@ -532,12 +566,12 @@ export default function OrderDetailPage() {
                 )}
               </div>
             </div>
-            
+
             <div className="flex justify-end gap-2">
               <Button variant="outline" onClick={() => setShowReturnDialog(false)}>
                 Cancel
               </Button>
-              <Button 
+              <Button
                 onClick={handleCreateReturn}
                 disabled={!returnData.returnType || !returnData.reason.trim()}
               >
@@ -545,6 +579,57 @@ export default function OrderDetailPage() {
               </Button>
             </div>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Tracking Dialog */}
+      <Dialog open={showTrackingDialog} onOpenChange={setShowTrackingDialog}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Order Tracking - {order.order_number}</DialogTitle>
+          </DialogHeader>
+          {trackingData && (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <Label className="text-muted-foreground">AWB Number</Label>
+                  <p className="font-mono font-medium">{trackingData.awb}</p>
+                </div>
+                <div>
+                  <Label className="text-muted-foreground">Current Status</Label>
+                  <Badge className="mt-1">
+                    {trackingData.current_status}
+                  </Badge>
+                </div>
+                <div>
+                  <Label className="text-muted-foreground">Current Location</Label>
+                  <p>{trackingData.current_location || 'N/A'}</p>
+                </div>
+                <div>
+                  <Label className="text-muted-foreground">Expected Delivery</Label>
+                  <p>{trackingData.expected_delivery || 'N/A'}</p>
+                </div>
+              </div>
+
+              {trackingData.tracking_history && trackingData.tracking_history.length > 0 && (
+                <div>
+                  <Label className="text-muted-foreground mb-2 block">Tracking History</Label>
+                  <div className="space-y-2 max-h-60 overflow-y-auto">
+                    {trackingData.tracking_history.map((event, index) => (
+                      <div key={index} className="flex gap-3 p-3 bg-muted/50 rounded-lg">
+                        <Clock className="w-4 h-4 text-muted-foreground mt-0.5" />
+                        <div className="flex-1">
+                          <p className="font-medium">{event.status}</p>
+                          <p className="text-sm text-muted-foreground">{event.location}</p>
+                          <p className="text-xs text-muted-foreground">{event.date}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </DialogContent>
       </Dialog>
     </div>

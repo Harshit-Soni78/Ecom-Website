@@ -58,7 +58,7 @@ JWT_ALGORITHM = "HS256"
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:3000", "http://127.0.0.1:5173"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -973,8 +973,8 @@ def create_role_change_notification(db: Session, user_id: str, old_role: str, ne
     """Create role change notification"""
     role_messages = {
         "customer_to_seller": "Congratulations! Your seller request has been approved. You can now start selling on our platform.",
-        "customer_to_admin": "You have been granted admin privileges. Welcome to the admin team!",
-        "seller_to_admin": "You have been promoted to admin. Welcome to the admin team!",
+        "customer_to_admin": "Welcome to Amorlias! You now have access for Admin.",
+        "seller_to_admin": "Welcome to Amorlias! You now have access for Admin.",
         "admin_to_seller": "Your role has been changed to seller.",
         "seller_to_customer": "Your seller privileges have been revoked.",
         "admin_to_customer": "Your admin privileges have been revoked."
@@ -1198,28 +1198,137 @@ def update_order_status(order_id: str, data: dict, admin: dict = Depends(admin_r
     
     # Create status-specific notification messages
     status_messages = {
-        "confirmed": f"Great news! Your order #{order.order_number} has been confirmed and is being prepared for shipment.",
-        "processing": f"Your order #{order.order_number} is now being processed. We'll update you once it's ready to ship.",
-        "shipped": f"Your order #{order.order_number} has been shipped! Track it with: {tracking_number or 'Tracking info will be updated soon'}",
-        "out_for_delivery": f"Your order #{order.order_number} is out for delivery. It should arrive today!",
+        "confirmed": f"Your order #{order.order_number} has been confirmed!",
+        "shipped": f"Your order #{order.order_number} has been shipped! Track it with ID: {tracking_number or order.tracking_number}",
         "delivered": f"Your order #{order.order_number} has been delivered successfully. Thank you for shopping with us!",
-        "cancelled": f"Your order #{order.order_number} has been cancelled. {notes}",
-        "returned": f"Your order #{order.order_number} return has been processed. {notes}"
+        "cancelled": f"Your order #{order.order_number} has been cancelled.",
+        "returned": f"Return process initiated for order #{order.order_number}."
     }
     
-    # Create tracking notification for user
+    # Create notification for user
     if order.user_id:
-        message = status_messages.get(new_status, f"Your order #{order.order_number} status has been updated to {new_status}")
-        create_order_tracking_notification(
-            db=db,
+        notification = models.Notification(
+            id=generate_id(),
+            type="order_status",
+            title=f"Order {order.status.title()}",
+            message=status_messages.get(new_status, f"Order #{order.order_number} status updated to {new_status}"),
             user_id=order.user_id,
-            order_id=order.id,
-            status=new_status,
-            message=message
+            data={"order_id": order.id}
         )
-    
+        db.add(notification)
+        
+        # Send email notification
+        if order.customer_phone or (order.user and order.user.email):
+             # Logic to send email would go here
+             pass
+
     db.commit()
-    return {"message": "Order status updated", "order": order}
+    return {"message": "Order status updated successfully", "order": order}
+
+@api_router.post("/admin/orders/{order_id}/sync-status")
+def sync_order_status(order_id: str, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
+    """Sync order status with courier service automatically"""
+    order = db.query(models.Order).filter(models.Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    if not order.tracking_number:
+        raise HTTPException(status_code=400, detail="Order has no tracking number linked")
+        
+    try:
+        # fetch latest tracking info
+        tracking_result = delhivery_service.track_order(order.tracking_number)
+        
+        if not tracking_result.get("success"):
+             raise HTTPException(status_code=400, detail=f"Tracking failed: {tracking_result.get('error')}")
+             
+        courier_status = tracking_result.get("status") # e.g. "Delivered", "In Transit"
+        
+        updated = False
+        original_status = order.status
+        
+        # Map courier status to our internal status
+        # Note: Delhivery statuses can vary, but "Delivered" is standard
+        status_map = {
+            "Delivered": "delivered",
+            "RTO": "returned",
+            "Dispatched": "shipped", 
+            "In Transit": "shipped",
+            "Pending": "pending",
+            "Manifested": "confirmed"
+        }
+        
+        # specific check for RTO/Returned
+        if "RTO" in str(courier_status).upper() or "RETURN" in str(courier_status).upper():
+            mapped_status = "returned"
+        elif "DELIVERED" in str(courier_status).upper():
+             mapped_status = "delivered"
+        else:
+             mapped_status = status_map.get(courier_status)
+             
+        if mapped_status and mapped_status != order.status:
+            # simple state machine check - don't revert delivered to shipped
+            if order.status == "delivered" and mapped_status == "shipped":
+                pass # ignore
+            else:
+                order.status = mapped_status
+                updated = True
+                
+                # Add to history
+                if not order.tracking_history: order.tracking_history = []
+                order.tracking_history.append({
+                    "status": mapped_status,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "notes": f"Auto-synced from Courier: {courier_status}",
+                    "updated_by": "System Sync"
+                })
+                
+                # Notify user if delivered
+                # Notify user for delivery status updates
+                if order.user_id:
+                     message = ""
+                     title = "Order Update"
+                     
+                     if mapped_status == "delivered":
+                         title = "Order Delivered"
+                         message = f"Your order #{order.order_number} has been delivered successfully. We hope you like it!"
+                     elif mapped_status == "shipped":
+                         title = "Order Shipped"
+                         message = f"Your order #{order.order_number} has been shipped. Track it with AWB: {order.tracking_number}"
+                     elif mapped_status == "returned":
+                         title = "Order Returned"
+                         message = f"Your order #{order.order_number} was marked as returned/RTO."
+
+                     if message:
+                        notification = models.Notification(
+                            id=generate_id(),
+                            type="order_status",
+                            title=title,
+                            message=message,
+                            user_id=order.user_id,
+                            data={"order_id": order.id, "status": mapped_status}
+                        )
+                        db.add(notification)
+        
+        # Always update the raw tracking history/notes if available? 
+        # For now just status sync is critical
+        
+        db.commit()
+        db.refresh(order)
+        
+        return {
+            "message": "Sync completed",
+            "updated": updated,
+            "original_status": original_status,
+            "new_status": order.status,
+            "courier_status": courier_status,
+            "tracking_data": tracking_result
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.put("/admin/users/{user_id}/role")
 def update_user_role(user_id: str, data: dict, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
@@ -1389,20 +1498,8 @@ def verify_pincode(data: PincodeVerify):
     if not pincode or len(pincode) != 6 or not pincode.isdigit():
         raise HTTPException(status_code=400, detail="Invalid pincode format")
     
-    first_digit = int(pincode[0])
-    regions = {
-        1: "Delhi/Haryana/Punjab/HP/J&K", 2: "UP/Uttarakhand", 3: "Rajasthan/Gujarat",
-        4: "Maharashtra/Goa/MP/Chhattisgarh", 5: "Andhra/Telangana/Karnataka", 
-        6: "Tamil Nadu/Kerala", 7: "West Bengal/Odisha/NE States", 8: "Bihar/Jharkhand"
-    }
-    
-    if first_digit in regions:
-        return {
-            "valid": True, "pincode": pincode, "region": regions[first_digit],
-            "serviceable": True, "estimated_delivery": "3-5 business days"
-        }
-    
-    return {"valid": False, "pincode": pincode, "serviceable": False}
+    # Use the shared Delhivery service for consistency
+    return delhivery_service.check_serviceability(pincode)
 
 # ============ BANNER ROUTES ============
 
@@ -1701,8 +1798,8 @@ def create_order(data: OrderCreate, request: Request, db: Session = Depends(get_
         create_admin_notification(
             db=db,
             type="new_order",
-            title="New Order Received",
-            message=f"New order #{new_order.order_number} from {user.get('name', 'Customer')} - ₹{new_order.grand_total}",
+            title="Ready to Dispatch",
+            message=f"Order #{new_order.order_number} is ready to dispatch. Customer: {user.get('name', 'Customer')} - ₹{new_order.grand_total}",
             data={
                 "order_id": new_order.id,
                 "order_number": new_order.order_number,
@@ -1718,7 +1815,53 @@ def create_order(data: OrderCreate, request: Request, db: Session = Depends(get_
 @api_router.get("/orders")
 def get_user_orders(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     orders = db.query(models.Order).filter(models.Order.user_id == user["id"]).order_by(models.Order.created_at.desc()).limit(100).all()
-    return orders
+    
+    # Enrich orders with current product information
+    enriched_orders = []
+    for order in orders:
+        order_dict = {
+            "id": order.id,
+            "order_number": order.order_number,
+            "user_id": order.user_id,
+            "customer_phone": order.customer_phone,
+            "subtotal": order.subtotal,
+            "gst_applied": order.gst_applied,
+            "gst_total": order.gst_total,
+            "discount_amount": order.discount_amount,
+            "grand_total": order.grand_total,
+            "shipping_address": order.shipping_address,
+            "payment_method": order.payment_method,
+            "payment_status": order.payment_status,
+            "status": order.status,
+            "is_offline": order.is_offline,
+            "tracking_number": order.tracking_number,
+            "courier_provider": order.courier_provider,
+            "tracking_history": order.tracking_history,
+            "notes": order.notes,
+            "created_at": order.created_at,
+            "updated_at": order.updated_at,
+            "items": []
+        }
+        
+        # Enrich items with current product images if missing
+        if order.items:
+            for item in order.items:
+                # Create a copy of the item dict
+                enriched_item = dict(item) if isinstance(item, dict) else item
+                
+                # If image_url is missing, fetch from current product
+                if not enriched_item.get("image_url"):
+                    product_id = enriched_item.get("product_id")
+                    if product_id:
+                        product = db.query(models.Product).filter(models.Product.id == product_id).first()
+                        if product and product.images and len(product.images) > 0:
+                            enriched_item["image_url"] = product.images[0]
+                
+                order_dict["items"].append(enriched_item)
+        
+        enriched_orders.append(order_dict)
+    
+    return enriched_orders
 
 @api_router.get("/orders/{order_id}")
 def get_order_by_id(order_id: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -1952,6 +2095,16 @@ def cancel_order(order_id: str, data: OrderCancellationRequest, user: dict = Dep
             status="cancelled",
             message=f"Your order #{order.order_number} has been cancelled. Reason: {data.reason}. Refund will be processed within 3-5 business days."
         )
+        
+        # Send cancellation email
+        user_obj = db.query(models.User).filter(models.User.id == order.user_id).first()
+        if user_obj and user_obj.email:
+            email_utils.send_order_cancelled_email(
+                to_email=user_obj.email,
+                order_number=order.order_number or "N/A",
+                reason=data.reason,
+                refund_amount=order.grand_total
+            )
     
     # Create admin notification
     create_admin_notification(
@@ -1994,11 +2147,11 @@ def create_return_request(order_id: str, data: ReturnRequestCreate, user: dict =
     if order.status not in ["delivered"]:
         raise HTTPException(status_code=400, detail=f"Cannot return order with status: {order.status}. Order must be delivered to initiate return.")
     
-    # Check if return window is valid (e.g., 7 days from delivery)
+    # Check if return window is valid (e.g., 5 days from delivery)
     if order.updated_at:
         days_since_delivery = (datetime.utcnow() - order.updated_at).days
-        if days_since_delivery > 7:
-            raise HTTPException(status_code=400, detail="Return window expired. Returns are only accepted within 7 days of delivery.")
+        if days_since_delivery > 5:
+            raise HTTPException(status_code=400, detail="Return window expired. Returns are only accepted within 5 days of delivery.")
     
     # Validate return items
     order_item_ids = {item.get("product_id") for item in order.items}
@@ -2157,122 +2310,133 @@ def update_return_request(return_id: str, data: ReturnRequestUpdate, admin: dict
     if not return_request:
         raise HTTPException(status_code=404, detail="Return request not found")
     
-    order = db.query(models.Order).filter(models.Order.id == return_request.order_id).first()
-    old_status = return_request.status
-    
-    # Update return request
-    return_request.status = data.status
-    return_request.updated_at = datetime.utcnow()
-    
-    if data.admin_notes:
-        return_request.notes = f"{return_request.notes or ''}\n\nAdmin Notes: {data.admin_notes}"
-    
-    if data.refund_amount is not None:
-        return_request.refund_amount = data.refund_amount
-    
-    if data.return_awb:
-        return_request.return_awb = data.return_awb
-    
-    if data.courier_provider:
-        return_request.courier_provider = data.courier_provider
-    
-    # Handle status-specific actions
-    if data.status == "approved" and old_status != "approved":
-        # Schedule pickup and create return shipment
-        try:
-            from courier_service import DelhiveryService
-            delhivery_service = DelhiveryService(os.environ.get('DELHIVERY_TOKEN', ''))
-            
-            # Create return shipment
-            return_data = {
-                "order_id": f"RET{return_request.id[:8]}",
-                "pickup_address": order.shipping_address,
-                "return_reason": return_request.reason,
-                "items": return_request.items
-            }
-            
-            result = delhivery_service.create_return_pickup(return_data)
-            if result.get("success"):
-                return_request.return_awb = result.get("return_awb")
-                return_request.pickup_scheduled_date = datetime.utcnow() + timedelta(days=1)
-                return_request.courier_provider = "Delhivery"
-        except Exception as e:
-            logging.warning(f"Failed to schedule return pickup: {str(e)}")
+    try:
+        order = db.query(models.Order).filter(models.Order.id == return_request.order_id).first()
+        old_status = return_request.status
         
-        # Restore inventory for approved returns
-        for item in return_request.items:
-            product = db.query(models.Product).filter(models.Product.id == item.get("product_id")).first()
-            if product:
-                product.stock_qty += item.get("quantity", 1)
+        # Update return request
+        return_request.status = data.status
+        return_request.updated_at = datetime.utcnow()
+        
+        if data.admin_notes:
+            return_request.notes = f"{return_request.notes or ''}\n\nAdmin Notes: {data.admin_notes}"
+        
+        if data.refund_amount is not None:
+            return_request.refund_amount = data.refund_amount
+        
+        if data.return_awb:
+            return_request.return_awb = data.return_awb
+        
+        if data.courier_provider:
+            return_request.courier_provider = data.courier_provider
+        
+        # Handle status-specific actions
+        if data.status == "approved" and old_status != "approved":
+            # Schedule pickup and create return shipment
+            try:
+                from courier_service import DelhiveryService
+                delhivery_service = DelhiveryService(os.environ.get('DELHIVERY_TOKEN', ''))
                 
-                # Log inventory adjustment
-                inventory_log = models.InventoryLog(
-                    id=generate_id(),
-                    product_id=product.id,
-                    sku=product.sku,
-                    type="return",
-                    quantity=item.get("quantity", 1),
-                    previous_qty=product.stock_qty - item.get("quantity", 1),
-                    new_qty=product.stock_qty,
-                    notes=f"Return approved - Return ID: {return_request.id}",
-                    created_by=admin["id"],
-                    created_at=datetime.utcnow()
-                )
-                db.add(inventory_log)
+                # Create return shipment
+                return_data = {
+                    "order_id": f"RET{return_request.id[:8]}",
+                    "pickup_address": order.shipping_address,
+                    "return_reason": return_request.reason,
+                    "items": return_request.items
+                }
+                
+                # Use create_return_shipment instead of non-existent create_return_pickup
+                result = delhivery_service.create_return_shipment(return_data)
+                
+                if result.get("success"):
+                    return_request.return_awb = result.get("return_awb")
+                    return_request.pickup_scheduled_date = datetime.utcnow() + timedelta(days=1)
+                    return_request.courier_provider = "Delhivery"
+            except Exception as e:
+                logging.warning(f"Failed to schedule return pickup: {str(e)}")
+            
+            # Restore inventory for approved returns
+            if return_request.items: # Check if items is not None
+                for item in return_request.items:
+                    product = db.query(models.Product).filter(models.Product.id == item["product_id"]).first()
+                    if product:
+                        product.stock_qty += item.get("quantity", 1)
+                        
+                        # Log inventory adjustment
+                        inventory_log = models.InventoryLog(
+                            id=generate_id(),
+                            product_id=product.id,
+                            sku=product.sku,
+                            type="return",
+                            quantity=item.get("quantity", 1),
+                            previous_qty=product.stock_qty - item.get("quantity", 1),
+                            new_qty=product.stock_qty,
+                            notes=f"Return approved - Return ID: {return_request.id}",
+                            created_by=admin["id"],
+                            created_at=datetime.utcnow()
+                        )
+                        db.add(inventory_log)
         
+        # Other statuses...
+        if data.status == "picked_up":
+            return_request.pickup_completed_date = datetime.utcnow()
+        elif data.status == "received":
+            return_request.received_date = datetime.utcnow()
+        
+        db.commit()
         # Create approval notification
-        create_notification(
-            db=db,
-            user_id=return_request.user_id,
-            type="return_approved",
-            title="Return Request Approved",
-            message=f"Your return request for order #{order.order_number} has been approved. Pickup will be scheduled within 24 hours. Refund of ₹{return_request.refund_amount} will be processed after we receive the items.",
-            data={
-                "return_id": return_request.id,
-                "order_number": order.order_number,
-                "refund_amount": return_request.refund_amount,
-                "pickup_awb": return_request.return_awb
-            }
-        )
+        if data.status == "approved" and old_status != "approved":
+            create_notification(
+                db=db,
+                user_id=return_request.user_id,
+                type="return_approved",
+                title="Return Request Approved",
+                message=f"Your return request for order #{order.order_number} has been approved. Pickup will be scheduled within 24 hours. Refund of ₹{return_request.refund_amount} will be processed after we receive the items.",
+                data={
+                    "return_id": return_request.id,
+                    "order_number": order.order_number,
+                    "refund_amount": return_request.refund_amount,
+                    "pickup_awb": return_request.return_awb
+                }
+            )
+            
+        elif data.status == "rejected" and old_status != "rejected":
+            # Create rejection notification
+            create_notification(
+                db=db,
+                user_id=return_request.user_id,
+                type="return_rejected",
+                title="Return Request Rejected",
+                message=f"Your return request for order #{order.order_number} has been rejected. Reason: {data.admin_notes or 'Does not meet return policy criteria'}",
+                data={
+                    "return_id": return_request.id,
+                    "order_number": order.order_number,
+                    "rejection_reason": data.admin_notes
+                }
+            )
+            
+        elif data.status == "completed":
+            # Mark refund as processed
+            create_notification(
+                db=db,
+                user_id=return_request.user_id,
+                type="return_completed",
+                title="Return Completed",
+                message=f"Your return for order #{order.order_number} has been completed. Refund of ₹{return_request.refund_amount} has been processed to your original payment method.",
+                data={
+                    "return_id": return_request.id,
+                    "order_number": order.order_number,
+                    "refund_amount": return_request.refund_amount
+                }
+            )
         
-    elif data.status == "rejected" and old_status != "rejected":
-        # Create rejection notification
-        create_notification(
-            db=db,
-            user_id=return_request.user_id,
-            type="return_rejected",
-            title="Return Request Rejected",
-            message=f"Your return request for order #{order.order_number} has been rejected. Reason: {data.admin_notes or 'Does not meet return policy criteria'}",
-            data={
-                "return_id": return_request.id,
-                "order_number": order.order_number,
-                "rejection_reason": data.admin_notes
-            }
-        )
-        
-    elif data.status == "completed":
-        # Mark refund as processed
-        create_notification(
-            db=db,
-            user_id=return_request.user_id,
-            type="return_completed",
-            title="Return Completed",
-            message=f"Your return for order #{order.order_number} has been completed. Refund of ₹{return_request.refund_amount} has been processed to your original payment method.",
-            data={
-                "return_id": return_request.id,
-                "order_number": order.order_number,
-                "refund_amount": return_request.refund_amount
-            }
-        )
-    
-    db.commit()
-    
-    return {
-        "message": f"Return request {data.status} successfully",
-        "return_id": return_request.id,
-        "status": data.status,
-        "refund_amount": return_request.refund_amount
-    }
+        db.commit()
+        return return_request
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 @api_router.get("/returns/{return_id}/tracking")
 def track_return_shipment(return_id: str, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -3272,7 +3436,7 @@ def cancel_shipment(order_id: str, admin: dict = Depends(admin_required), db: Se
     else:
         raise HTTPException(status_code=400, detail=f"Cancellation failed: {result.get('error')}")
 
-@api_router.post("/courier/create-return/{order_id}")
+@api_router.post("/admin/couriers/create-return/{order_id}")
 def create_return_shipment(order_id: str, return_data: dict, admin: dict = Depends(admin_required), db: Session = Depends(get_db)):
     """Create a return shipment for an order"""
     order = db.query(models.Order).filter(models.Order.id == order_id).first()
@@ -4740,7 +4904,7 @@ def generate_shipping_label_pdf(order_id: str, db: Session):
         
         # Return Address (Left)
         p.setFont("Helvetica-Bold", 7)
-        p.drawString(10, y_line1 - 10, "If undelivered, return to:")
+        p.drawString(10, y_line1 - 10, "")
         
         # Use Company Name for Return Address as requested
         p.setFont("Helvetica-Bold", 8)
@@ -5168,31 +5332,6 @@ def delete_offer(offer_id: str, admin: dict = Depends(admin_required), db: Sessi
 
 
 # ============ UPLOAD ENDPOINTS ============
-
-@api_router.post("/upload/image")
-async def upload_single_image(
-    file: UploadFile = File(...),
-    folder: str = "general",
-    image_type: Optional[str] = None,
-    admin: dict = Depends(admin_required)
-):
-    """Upload a single image file"""
-    try:
-        # Validate file type
-        if not file.content_type or not file.content_type.startswith('image/'):
-            raise HTTPException(status_code=400, detail="File must be an image")
-        
-        # Save the uploaded file
-        file_url = save_uploaded_file(file, folder, image_type)
-        
-        return {
-            "message": "Image uploaded successfully",
-            "url": file_url,
-            "filename": file.filename
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to upload image: {str(e)}")
 
 @api_router.post("/upload/multiple")
 async def upload_multiple_images(

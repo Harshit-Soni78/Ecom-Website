@@ -13,6 +13,8 @@ import { Tabs, TabsList, TabsTrigger } from '../../components/ui/tabs';
 import { ordersAPI, couriersAPI } from '../../lib/api';
 import { toast } from 'sonner';
 import { Search, Eye, Truck, FileText, Printer, Package } from 'lucide-react';
+import ShippingLabel from '../../components/ShippingLabel';
+import { useRef, useState as useReactState } from 'react';
 
 export default function AdminOrders() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -24,6 +26,10 @@ export default function AdminOrders() {
   const [showDialog, setShowDialog] = useState(false);
   const [selectedOrder, setSelectedOrder] = useState(null);
   const [updateData, setUpdateData] = useState({ status: '', tracking_number: '', courier_provider: '', notes: '' });
+  const [showLabelDialog, setShowLabelDialog] = useState(false);
+  const [labelOrder, setLabelOrder] = useState(null);
+  const [settings, setSettings] = useState(null);
+  const labelRef = useRef(null);
 
   useEffect(() => {
     fetchData();
@@ -70,11 +76,11 @@ export default function AdminOrders() {
   const handlePrintInvoice = async (orderId) => {
     try {
       const response = await ordersAPI.getInvoice(orderId);
-      
+
       // Create blob from response data
       const blob = new Blob([response.data], { type: 'application/pdf' });
       const url = window.URL.createObjectURL(blob);
-      
+
       // Open in new window for printing
       const printWindow = window.open(url, '_blank');
       if (printWindow) {
@@ -90,7 +96,7 @@ export default function AdminOrders() {
         link.click();
         document.body.removeChild(link);
       }
-      
+
       // Clean up
       setTimeout(() => window.URL.revokeObjectURL(url), 1000);
     } catch (error) {
@@ -102,11 +108,11 @@ export default function AdminOrders() {
   const handlePrintLabel = async (orderId) => {
     try {
       const response = await ordersAPI.getShippingLabel(orderId);
-      
+
       // Create blob from response data
       const blob = new Blob([response.data], { type: 'application/pdf' });
       const url = window.URL.createObjectURL(blob);
-      
+
       // Open in new window for printing
       const printWindow = window.open(url, '_blank');
       if (printWindow) {
@@ -122,7 +128,7 @@ export default function AdminOrders() {
         link.click();
         document.body.removeChild(link);
       }
-      
+
       // Clean up
       setTimeout(() => window.URL.revokeObjectURL(url), 1000);
     } catch (error) {
@@ -132,9 +138,9 @@ export default function AdminOrders() {
   };
 
   const filteredOrders = orders.filter(o =>
-    o.order_number.toLowerCase().includes(search.toLowerCase()) ||
-    o.customer_phone?.includes(search) ||
-    o.customer_name?.toLowerCase().includes(search.toLowerCase())
+    (o.order_number || '').toLowerCase().includes(search.toLowerCase()) ||
+    (o.customer_phone || '').includes(search) ||
+    (o.customer_name || '').toLowerCase().includes(search.toLowerCase())
   );
 
   const getStatusBadgeClass = (status) => {
@@ -260,13 +266,13 @@ export default function AdminOrders() {
               <div>
                 <h4 className="font-semibold mb-3">Items</h4>
                 <div className="space-y-2">
-                  {selectedOrder.items.map((item, index) => (
+                  {selectedOrder.items?.map((item, index) => (
                     <div key={index} className="flex justify-between p-3 bg-slate-700/50 rounded-lg">
                       <div>
-                        <p className="font-medium">{item.product_name}</p>
-                        <p className="text-sm text-slate-400">SKU: {item.sku} | Qty: {item.quantity}</p>
+                        <p className="font-medium">{item.product_name || 'Unknown Product'}</p>
+                        <p className="text-sm text-slate-400">SKU: {item.sku || 'N/A'} | Qty: {item.quantity || 0}</p>
                       </div>
-                      <p className="font-semibold">₹{item.total.toLocaleString()}</p>
+                      <p className="font-semibold">₹{(item.total || 0).toLocaleString()}</p>
                     </div>
                   ))}
                 </div>
@@ -280,11 +286,13 @@ export default function AdminOrders() {
               <div>
                 <h4 className="font-semibold mb-3">Shipping Address</h4>
                 <div className="p-3 bg-slate-700/50 rounded-lg text-sm">
-                  <p className="font-medium">{selectedOrder.shipping_address.name}</p>
-                  <p className="text-slate-400">{selectedOrder.shipping_address.line1}</p>
-                  {selectedOrder.shipping_address.line2 && <p className="text-slate-400">{selectedOrder.shipping_address.line2}</p>}
-                  <p className="text-slate-400">{selectedOrder.shipping_address.city}, {selectedOrder.shipping_address.state} - {selectedOrder.shipping_address.pincode}</p>
-                  <p className="text-slate-400">Phone: {selectedOrder.shipping_address.phone}</p>
+                  <p className="font-medium">{selectedOrder.shipping_address?.name || 'N/A'}</p>
+                  <p className="text-slate-400">{selectedOrder.shipping_address?.line1 || ''}</p>
+                  {selectedOrder.shipping_address?.line2 && <p className="text-slate-400">{selectedOrder.shipping_address.line2}</p>}
+                  <p className="text-slate-400">
+                    {selectedOrder.shipping_address?.city || ''}, {selectedOrder.shipping_address?.state || ''} - {selectedOrder.shipping_address?.pincode || ''}
+                  </p>
+                  <p className="text-slate-400">Phone: {selectedOrder.shipping_address?.phone || selectedOrder.customer_phone || 'N/A'}</p>
                 </div>
               </div>
 
@@ -345,6 +353,29 @@ export default function AdminOrders() {
                     Update Order
                   </Button>
                 </div>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Shipping Label Dialog */}
+      <Dialog open={showLabelDialog} onOpenChange={setShowLabelDialog}>
+        <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto bg-white">
+          <DialogHeader>
+            <DialogTitle className="text-black">Shipping Label - {labelOrder?.order_number}</DialogTitle>
+          </DialogHeader>
+          {labelOrder && (
+            <div>
+              <div ref={labelRef}>
+                <ShippingLabel order={labelOrder} settings={settings} />
+              </div>
+              <div className="flex justify-end gap-3 mt-4 pt-4 border-t">
+                <Button variant="ghost" onClick={() => setShowLabelDialog(false)}>Close</Button>
+                <Button onClick={handlePrintShippingLabel} className="bg-primary hover:bg-primary/90">
+                  <Printer className="w-4 h-4 mr-2" />
+                  Print Label
+                </Button>
               </div>
             </div>
           )}

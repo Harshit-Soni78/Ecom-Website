@@ -8,9 +8,9 @@ import { Badge } from '../components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '../components/ui/dialog';
 import { useAuth } from '../contexts/AuthContext';
-import { ordersAPI, notificationsAPI, sellerRequestsAPI, pincodeAPI } from '../lib/api';
+import { ordersAPI, notificationsAPI, sellerRequestsAPI, pincodeAPI, authAPI } from '../lib/api';
 import { toast } from 'sonner';
-import { User, MapPin, Package, Bell, Store, Plus, Check, X, Truck, Edit, Save } from 'lucide-react';
+import { User, MapPin, Package, Bell, Store, Plus, Check, X, Truck, Edit, Save, Lock } from 'lucide-react';
 
 export default function ProfilePage() {
   const navigate = useNavigate();
@@ -22,7 +22,7 @@ export default function ProfilePage() {
   const [editMode, setEditMode] = useState(false);
   const [showAddressDialog, setShowAddressDialog] = useState(false);
   const [showSellerDialog, setShowSellerDialog] = useState(false);
-  
+
   const [profile, setProfile] = useState({
     name: '',
     email: '',
@@ -45,6 +45,13 @@ export default function ProfilePage() {
   const [sellerRequest, setSellerRequest] = useState({
     business_name: '',
     gst_number: '',
+  });
+
+  const [showPasswordDialog, setShowPasswordDialog] = useState(false);
+  const [passwordForm, setPasswordForm] = useState({
+    current_password: '',
+    new_password: '',
+    confirm_password: '',
   });
 
   const [pincodeValid, setPincodeValid] = useState(null);
@@ -87,13 +94,52 @@ export default function ProfilePage() {
     }
   };
 
+  const handleChangePassword = async () => {
+    if (!passwordForm.current_password || !passwordForm.new_password || !passwordForm.confirm_password) {
+      toast.error('Please fill all password fields');
+      return;
+    }
+
+    if (passwordForm.new_password !== passwordForm.confirm_password) {
+      toast.error('New passwords do not match');
+      return;
+    }
+
+    if (passwordForm.new_password.length < 6) {
+      toast.error('Password must be at least 6 characters');
+      return;
+    }
+
+    try {
+      await authAPI.changePassword({
+        current_password: passwordForm.current_password,
+        new_password: passwordForm.new_password
+      });
+      toast.success('Password changed successfully');
+      setShowPasswordDialog(false);
+      setPasswordForm({
+        current_password: '',
+        new_password: '',
+        confirm_password: '',
+      });
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Failed to change password');
+    }
+  };
+
   const verifyPincode = async (pincode) => {
     if (pincode.length === 6) {
       try {
         const response = await pincodeAPI.verify(pincode);
+        // Response format is now from DelhiveryService: { serviceable: bool, city: str, state: str, ... }
         setPincodeValid(response.data);
-        if (response.data.valid) {
-          toast.success(`Serviceable: ${response.data.region}`);
+        if (response.data.serviceable) {
+          toast.success(`Serviceable: ${response.data.city}, ${response.data.state}`);
+          setNewAddress(prev => ({
+            ...prev,
+            city: response.data.city || prev.city,
+            state: response.data.state || prev.state
+          }));
         } else {
           toast.error('This pincode is not serviceable');
         }
@@ -110,7 +156,7 @@ export default function ProfilePage() {
     }
 
     const updatedAddresses = [...profile.addresses, { ...newAddress, id: Date.now().toString() }];
-    
+
     try {
       await updateProfile({ addresses: updatedAddresses });
       setProfile({ ...profile, addresses: updatedAddresses });
@@ -216,7 +262,7 @@ export default function ProfilePage() {
                 <div className="space-y-2">
                   <Label htmlFor="gst_number">GST Number</Label>
                   <Input
-                  id="gst_number"
+                    id="gst_number"
                     required
                     value={sellerRequest.gst_number}
                     onChange={(e) => setSellerRequest({ ...sellerRequest, gst_number: e.target.value.toUpperCase() })}
@@ -297,6 +343,54 @@ export default function ProfilePage() {
                   <p className="text-xs text-muted-foreground">Phone number cannot be changed</p>
                 </div>
               </div>
+
+              <div className="pt-4 border-t">
+                <Dialog open={showPasswordDialog} onOpenChange={setShowPasswordDialog}>
+                  <DialogTrigger asChild>
+                    <Button variant="outline" className="w-full sm:w-auto">
+                      <Lock className="w-4 h-4 mr-2" />
+                      Change Password
+                    </Button>
+                  </DialogTrigger>
+                  <DialogContent>
+                    <DialogHeader>
+                      <DialogTitle>Change Password</DialogTitle>
+                    </DialogHeader>
+                    <div className="space-y-4">
+                      <div className="space-y-2">
+                        <Label>Current Password</Label>
+                        <Input
+                          type="password"
+                          value={passwordForm.current_password}
+                          onChange={(e) => setPasswordForm({ ...passwordForm, current_password: e.target.value })}
+                          placeholder="Enter current password"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label>New Password</Label>
+                        <Input
+                          type="password"
+                          value={passwordForm.new_password}
+                          onChange={(e) => setPasswordForm({ ...passwordForm, new_password: e.target.value })}
+                          placeholder="Enter new password (min 6 chars)"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label>Confirm New Password</Label>
+                        <Input
+                          type="password"
+                          value={passwordForm.confirm_password}
+                          onChange={(e) => setPasswordForm({ ...passwordForm, confirm_password: e.target.value })}
+                          placeholder="Confirm new password"
+                        />
+                      </div>
+                      <Button onClick={handleChangePassword} className="w-full btn-primary">
+                        Update Password
+                      </Button>
+                    </div>
+                  </DialogContent>
+                </Dialog>
+              </div>
             </CardContent>
           </Card>
         </TabsContent>
@@ -375,15 +469,22 @@ export default function ProfilePage() {
                           value={newAddress.pincode}
                           onChange={(e) => {
                             const val = e.target.value.replace(/\D/g, '').slice(0, 6);
+                            if (val === newAddress.pincode) return;
+
                             setNewAddress({ ...newAddress, pincode: val });
-                            if (val.length === 6) verifyPincode(val);
+
+                            if (val.length === 6) {
+                              verifyPincode(val);
+                            } else {
+                              setPincodeValid(null);
+                            }
                           }}
                           placeholder="6-digit"
-                          className={pincodeValid?.valid === false ? 'border-red-500' : ''}
+                          className={pincodeValid?.serviceable === false ? 'border-red-500' : ''}
                         />
                         {pincodeValid && (
-                          <p className={`text-xs ${pincodeValid.valid ? 'text-emerald-500' : 'text-red-500'}`}>
-                            {pincodeValid.valid ? `✓ ${pincodeValid.region}` : 'Not serviceable'}
+                          <p className={`text-xs ${pincodeValid.serviceable ? 'text-emerald-500' : 'text-red-500'}`}>
+                            {pincodeValid.serviceable ? `✓ ${pincodeValid.city}, ${pincodeValid.state}` : 'Not serviceable'}
                           </p>
                         )}
                       </div>
@@ -488,7 +589,7 @@ export default function ProfilePage() {
                 </Button>
               )}
             </div>
-            
+
             {notifications.length === 0 ? (
               <Card className="p-8 text-center">
                 <Bell className="w-12 h-12 mx-auto text-muted-foreground/50 mb-4" />
@@ -497,8 +598,8 @@ export default function ProfilePage() {
             ) : (
               <div className="space-y-2">
                 {notifications.map((notif) => (
-                  <Card 
-                    key={notif.id} 
+                  <Card
+                    key={notif.id}
                     className={`cursor-pointer transition-colors ${!notif.read ? 'bg-primary/5 border-primary/20' : ''}`}
                     onClick={() => {
                       markNotificationRead(notif.id);
